@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slm-os-scheduler-ai"
+version = "0.1.0"
+description = "AI-driven process scheduler for SLM-OS"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=1.26.0",
+    "gymnasium>=0.29.0",
+    "pyarrow>=14.0.0",
+    "pandas>=2.1.0",
+    "torch>=2.1.0",
+    "onnx>=1.15.0",
+    "onnxruntime>=1.16.0",
+    "xgboost>=2.0.0",
+    "stable-baselines3>=2.2.0",
+    "optuna>=3.4.0",
+    "matplotlib>=3.8.0",
+    "seaborn>=0.13.0",
+    "shap>=0.43.0",
+    "scipy>=1.11.0",
+    "tensorboard>=2.15.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["slm_sim*", "training*", "evaluation*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"

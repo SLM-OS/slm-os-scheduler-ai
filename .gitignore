@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Generated data (large)
+data/raw/
+data/splits/
+data/normalization.json
+
+# Trained models (large)
+models/mlp/*.pt
+models/mlp/*.onnx
+models/xgboost/*.json
+models/xgboost/*.c
+models/rl/*.pt
+models/rl/*.onnx
+
+# Results (regenerable)
+results/charts/
+results/*.csv
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
