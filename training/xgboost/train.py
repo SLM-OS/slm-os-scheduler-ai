@@ -8,11 +8,17 @@ See plan Sections 4.2 and 7.2.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+
+
+def _ts() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 import xgboost as xgb
 from sklearn.preprocessing import LabelEncoder
 
@@ -108,6 +114,7 @@ def train_triple_classifier(
     core_config: Optional[XGBConfig] = None,
     priority_config: Optional[XGBConfig] = None,
     preempt_config: Optional[XGBConfig] = None,
+    max_rows: Optional[int] = None,
 ) -> tuple[TripleClassifier, dict]:
     """Train the three-classifier XGBoost ensemble.
 
@@ -117,6 +124,7 @@ def train_triple_classifier(
         core_config: Config for core assignment classifier.
         priority_config: Config for priority adjustment classifier.
         preempt_config: Config for preempt decision classifier.
+        max_rows: If set, subsample training/val data to this many rows.
 
     Returns:
         Tuple of (TripleClassifier, metrics_dict).
@@ -129,7 +137,9 @@ def train_triple_classifier(
         preempt_config = XGBConfig(n_estimators=100, max_depth=6)
 
     # Load training data
-    X_train, y_core, y_priority, y_preempt = load_features_and_labels(train_path)
+    X_train, y_core, y_priority, y_preempt = load_features_and_labels(
+        train_path, max_rows=max_rows,
+    )
     feature_names = get_feature_names()
 
     if len(X_train) == 0:
@@ -157,25 +167,43 @@ def train_triple_classifier(
             eval_metric="mlogloss",
         )
 
+    print(f"[{_ts()}] Training on {len(X_train):,} samples, "
+          f"{len(np.unique(y_core))} core classes, "
+          f"{len(np.unique(y_priority))} priority classes, "
+          f"{len(np.unique(y_preempt))} preempt classes", flush=True)
+    train_start = time.time()
+
     # --- Classifier 1: Core Assignment ---
+    print(f"[{_ts()}] Training core assignment classifier "
+          f"({core_config.n_estimators} trees, depth {core_config.max_depth})...", flush=True)
+    t0 = time.time()
     core_clf = _make_clf(core_config)
     core_clf.fit(X_train, y_core_enc)
+    print(f"[{_ts()}] Core classifier done ({time.time() - t0:.1f}s)", flush=True)
 
     # --- Classifier 2: Priority Adjustment (conditioned on predicted core) ---
+    print(f"[{_ts()}] Training priority classifier "
+          f"({priority_config.n_estimators} trees, depth {priority_config.max_depth})...", flush=True)
+    t0 = time.time()
     core_pred_enc = core_clf.predict(X_train)
     core_pred_orig = core_le.inverse_transform(core_pred_enc)
     X_train_c = np.hstack([X_train, core_pred_orig.reshape(-1, 1)])
 
     priority_clf = _make_clf(priority_config)
     priority_clf.fit(X_train_c, y_priority_enc)
+    print(f"[{_ts()}] Priority classifier done ({time.time() - t0:.1f}s)", flush=True)
 
     # --- Classifier 3: Preempt Decision (conditioned on predicted core + priority) ---
+    print(f"[{_ts()}] Training preempt classifier "
+          f"({preempt_config.n_estimators} trees, depth {preempt_config.max_depth})...", flush=True)
+    t0 = time.time()
     prio_pred_enc = priority_clf.predict(X_train_c)
     prio_pred_orig = priority_le.inverse_transform(prio_pred_enc)
     X_train_cp = np.hstack([X_train_c, prio_pred_orig.reshape(-1, 1)])
 
     preempt_clf = _make_clf(preempt_config)
     preempt_clf.fit(X_train_cp, y_preempt_enc)
+    print(f"[{_ts()}] Preempt classifier done ({time.time() - t0:.1f}s)", flush=True)
 
     triple = TripleClassifier(
         core_clf, priority_clf, preempt_clf, feature_names,
@@ -183,20 +211,35 @@ def train_triple_classifier(
     )
 
     # Evaluate
+    print(f"[{_ts()}] Evaluating on training set...", flush=True)
     metrics = {"train_samples": len(X_train)}
     train_c, train_p, train_pr = triple.predict(X_train)
     metrics["train_core_acc"] = float((train_c == y_core).mean())
     metrics["train_priority_acc"] = float((train_p == y_priority).mean())
     metrics["train_preempt_acc"] = float((train_pr == y_preempt).mean())
+    print(f"[{_ts()}] Train — core={metrics['train_core_acc']:.4f}  "
+          f"priority={metrics['train_priority_acc']:.4f}  "
+          f"preempt={metrics['train_preempt_acc']:.4f}", flush=True)
 
     if val_path:
-        X_val, vy_core, vy_priority, vy_preempt = load_features_and_labels(val_path)
+        print(f"[{_ts()}] Loading validation data...", flush=True)
+        val_max = max_rows // 4 if max_rows else None
+        X_val, vy_core, vy_priority, vy_preempt = load_features_and_labels(
+            val_path, max_rows=val_max,
+        )
         if len(X_val) > 0:
+            print(f"[{_ts()}] Evaluating on {len(X_val):,} val samples...", flush=True)
             val_c, val_p, val_pr = triple.predict(X_val)
             metrics["val_samples"] = len(X_val)
             metrics["val_core_acc"] = float((val_c == vy_core).mean())
             metrics["val_priority_acc"] = float((val_p == vy_priority).mean())
             metrics["val_preempt_acc"] = float((val_pr == vy_preempt).mean())
+            print(f"[{_ts()}] Val   — core={metrics['val_core_acc']:.4f}  "
+                  f"priority={metrics['val_priority_acc']:.4f}  "
+                  f"preempt={metrics['val_preempt_acc']:.4f}", flush=True)
+
+    total_elapsed = time.time() - train_start
+    print(f"[{_ts()}] XGBoost training complete in {total_elapsed:.1f}s", flush=True)
 
     return triple, metrics
 

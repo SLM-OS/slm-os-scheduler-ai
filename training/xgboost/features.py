@@ -155,12 +155,19 @@ def get_feature_names() -> list[str]:
 def load_features_and_labels(
     parquet_path: Path | str,
     experts: set[str] | None = None,
+    max_rows: int | None = None,
+    seed: int = 42,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load features and decomposed action labels from a Parquet file.
+
+    Streams row groups one at a time to avoid holding the full PyArrow
+    table alongside the numpy arrays.
 
     Args:
         parquet_path: Path to Parquet file.
         experts: Expert names to include. None = all non-random.
+        max_rows: If set, randomly subsample to at most this many rows.
+        seed: Random seed for subsampling.
 
     Returns:
         Tuple of (X, y_core, y_priority, y_preempt) where:
@@ -169,27 +176,96 @@ def load_features_and_labels(
             y_priority: (N,) priority adjustment labels
             y_preempt: (N,) preempt decision labels
     """
-    table = pq.read_table(Path(parquet_path))
-
-    # Filter by expert
+    parquet_path = Path(parquet_path)
     if experts is None:
         experts = {"slm_os_hybrid", "edf", "weighted_multi_objective"}
-    expert_col = table.column("expert_policy").to_pylist()
-    mask = np.array([e in experts for e in expert_col])
-    table = table.filter(mask)
-    n = len(table)
 
-    # Extract base state features
+    needed_cols = (
+        [f"state_{j:03d}" for j in range(TOTAL_FEATURES)]
+        + ["action_core", "action_priority", "action_preempt", "expert_policy"]
+    )
+    pf = pq.ParquetFile(parquet_path)
+
+    # Pass 1: count expert rows
+    total_expert_rows = 0
+    for i in range(pf.metadata.num_row_groups):
+        rg = pf.read_row_group(i, columns=["expert_policy"])
+        total_expert_rows += sum(1 for e in rg.column("expert_policy").to_pylist()
+                                 if e in experts)
+        del rg
+
+    if total_expert_rows == 0:
+        empty = np.zeros((0, TOTAL_FEATURES + N_DERIVED_FEATURES), dtype=np.float32)
+        return empty, np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.int32)
+
+    if max_rows and total_expert_rows > max_rows:
+        n = max_rows
+        sample_ratio = max_rows / total_expert_rows
+    else:
+        n = total_expert_rows
+        sample_ratio = None
+
+    rng = np.random.default_rng(seed)
+
+    # Allocate output arrays
     states = np.zeros((n, TOTAL_FEATURES), dtype=np.float32)
-    for j in range(TOTAL_FEATURES):
-        states[:, j] = table.column(f"state_{j:03d}").to_numpy()
+    y_core = np.zeros(n, dtype=np.int32)
+    y_priority = np.zeros(n, dtype=np.int32)
+    y_preempt = np.zeros(n, dtype=np.int32)
+    write_pos = 0
+
+    # Pass 2: stream row groups
+    for i in range(pf.metadata.num_row_groups):
+        rg = pf.read_row_group(i, columns=needed_cols)
+        expert_col = rg.column("expert_policy").to_pylist()
+        mask = np.array([e in experts for e in expert_col])
+        if mask.sum() == 0:
+            del rg
+            continue
+
+        rg = rg.filter(mask)
+        rg_n = len(rg)
+
+        if sample_ratio is not None:
+            keep = int(round(rg_n * sample_ratio))
+            if keep == 0:
+                del rg
+                continue
+            keep = min(keep, n - write_pos)
+            idx = rng.choice(rg_n, size=keep, replace=False)
+            idx.sort()
+            for j in range(TOTAL_FEATURES):
+                states[write_pos:write_pos + keep, j] = (
+                    rg.column(f"state_{j:03d}").to_numpy()[idx]
+                )
+            y_core[write_pos:write_pos + keep] = rg.column("action_core").to_numpy().astype(np.int32)[idx]
+            y_priority[write_pos:write_pos + keep] = rg.column("action_priority").to_numpy().astype(np.int32)[idx]
+            y_preempt[write_pos:write_pos + keep] = rg.column("action_preempt").to_numpy().astype(np.int32)[idx]
+            write_pos += keep
+        else:
+            chunk = min(rg_n, n - write_pos)
+            for j in range(TOTAL_FEATURES):
+                states[write_pos:write_pos + chunk, j] = (
+                    rg.column(f"state_{j:03d}").to_numpy()[:chunk]
+                )
+            y_core[write_pos:write_pos + chunk] = rg.column("action_core").to_numpy().astype(np.int32)[:chunk]
+            y_priority[write_pos:write_pos + chunk] = rg.column("action_priority").to_numpy().astype(np.int32)[:chunk]
+            y_preempt[write_pos:write_pos + chunk] = rg.column("action_preempt").to_numpy().astype(np.int32)[:chunk]
+            write_pos += chunk
+
+        del rg
+        if write_pos >= n:
+            break
+
+    # Trim if needed
+    if write_pos < n:
+        states = states[:write_pos]
+        y_core = y_core[:write_pos]
+        y_priority = y_priority[:write_pos]
+        y_preempt = y_preempt[:write_pos]
 
     # Add derived features
     X = add_derived_features(states)
-
-    # Extract decomposed action labels
-    y_core = table.column("action_core").to_numpy().astype(np.int32)
-    y_priority = table.column("action_priority").to_numpy().astype(np.int32)
-    y_preempt = table.column("action_preempt").to_numpy().astype(np.int32)
+    del states
 
     return X, y_core, y_priority, y_preempt

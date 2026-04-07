@@ -6,7 +6,9 @@ See plan Section 7.1.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -19,6 +21,11 @@ from torch.utils.data import DataLoader
 
 from training.mlp.dataset import SchedulerDataset
 from training.mlp.model import SchedulerMLP
+
+
+def _ts() -> str:
+    """Current timestamp string."""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 @dataclass
@@ -104,8 +111,16 @@ def train_mlp(
 
     result = TrainResult()
     patience_counter = 0
+    train_start = time.time()
+    n_batches = len(train_loader)
+
+    print(f"[{_ts()}] Starting MLP training: {config.n_epochs} epochs, "
+          f"{len(train_dataset)} train / {len(val_dataset)} val samples, "
+          f"{n_batches} batches/epoch", flush=True)
 
     for epoch in range(config.n_epochs):
+        epoch_start = time.time()
+
         # --- Train ---
         model.train()
         train_loss_sum = 0.0
@@ -139,19 +154,37 @@ def train_mlp(
         result.val_losses.append(val_loss)
         result.val_accuracies.append(val_acc)
 
+        epoch_elapsed = time.time() - epoch_start
+        improved = ""
+
         # --- Early stopping ---
         if val_loss < result.best_val_loss:
             result.best_val_loss = val_loss
             result.best_val_acc = val_acc
             result.best_epoch = epoch
             patience_counter = 0
+            improved = " *best*"
             if save_path:
                 save_path.parent.mkdir(parents=True, exist_ok=True)
                 torch.save(model.state_dict(), save_path)
         else:
             patience_counter += 1
             if patience_counter >= config.patience:
+                print(f"[{_ts()}] Early stopping at epoch {epoch} "
+                      f"(no improvement for {config.patience} epochs)", flush=True)
                 break
+
+        lr = optimizer.param_groups[0]["lr"]
+        print(f"[{_ts()}] Epoch {epoch:3d}/{config.n_epochs} — "
+              f"train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
+              f"val_acc={val_acc:.4f}  lr={lr:.2e}  "
+              f"({epoch_elapsed:.1f}s){improved}", flush=True)
+
+    total_elapsed = time.time() - train_start
+    print(f"[{_ts()}] MLP training complete in {total_elapsed:.1f}s — "
+          f"best epoch {result.best_epoch}, "
+          f"val_loss={result.best_val_loss:.4f}, "
+          f"val_acc={result.best_val_acc:.4f}", flush=True)
 
     # Load best model if we saved one
     if save_path and save_path.exists():

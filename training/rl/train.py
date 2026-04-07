@@ -7,7 +7,9 @@ See plan Sections 4.3 and 7.3.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -15,13 +17,54 @@ import numpy as np
 import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import (
+    BaseCallback,
     CallbackList,
+    CheckpointCallback,
     EvalCallback,
 )
 
 from training.rl.curriculum import CurriculumCallback, CurriculumSchedule
 from training.rl.network import SchedulerActorCriticPolicy
 from training.rl.vec_env import make_vec_env
+
+
+def _ts() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+class ProgressCallback(BaseCallback):
+    """Prints timestamped progress at regular intervals."""
+
+    def __init__(self, total_timesteps: int, log_interval: int = 100_000, verbose: int = 0):
+        super().__init__(verbose)
+        self.total_timesteps = total_timesteps
+        self.log_interval = log_interval
+        self.next_log = log_interval
+        self.start_time = None
+
+    def _on_training_start(self) -> None:
+        self.start_time = time.time()
+        print(f"[{_ts()}] PPO training started: {self.total_timesteps:,} total timesteps",
+              flush=True)
+
+    def _on_step(self) -> bool:
+        if self.num_timesteps >= self.next_log:
+            elapsed = time.time() - self.start_time
+            pct = 100 * self.num_timesteps / self.total_timesteps
+            rate = self.num_timesteps / elapsed if elapsed > 0 else 0
+            eta_s = (self.total_timesteps - self.num_timesteps) / rate if rate > 0 else 0
+            eta_m = eta_s / 60
+
+            print(f"[{_ts()}] PPO: {self.num_timesteps:>10,}/{self.total_timesteps:,} "
+                  f"({pct:5.1f}%)  {rate:,.0f} steps/s  "
+                  f"ETA {eta_m:.0f}m", flush=True)
+            self.next_log += self.log_interval
+        return True
+
+    def _on_training_end(self) -> None:
+        elapsed = time.time() - self.start_time
+        print(f"[{_ts()}] PPO training complete in {elapsed / 60:.1f} minutes",
+              flush=True)
 
 
 @dataclass
@@ -117,6 +160,12 @@ def train_ppo(config: PPOConfig = PPOConfig()) -> PPO:
     # Callbacks
     callbacks = []
 
+    # Progress logging every 100K steps
+    callbacks.append(ProgressCallback(
+        total_timesteps=config.total_timesteps,
+        log_interval=100_000,
+    ))
+
     if config.use_curriculum:
         schedule = CurriculumSchedule()
         callbacks.append(CurriculumCallback(schedule, verbose=1))
@@ -124,6 +173,15 @@ def train_ppo(config: PPOConfig = PPOConfig()) -> PPO:
     if config.save_dir:
         save_path = Path(config.save_dir)
         save_path.mkdir(parents=True, exist_ok=True)
+
+        # Save checkpoint every 500K steps
+        callbacks.append(CheckpointCallback(
+            save_freq=max(500_000 // config.n_envs, 1),
+            save_path=str(save_path / "checkpoints"),
+            name_prefix="ppo",
+            verbose=0,
+        ))
+
         eval_callback = EvalCallback(
             eval_env,
             best_model_save_path=str(save_path),
@@ -135,7 +193,7 @@ def train_ppo(config: PPOConfig = PPOConfig()) -> PPO:
         )
         callbacks.append(eval_callback)
 
-    callback = CallbackList(callbacks) if callbacks else None
+    callback = CallbackList(callbacks)
 
     # Train
     model.learn(

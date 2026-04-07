@@ -34,6 +34,9 @@ models/xgboost/*.c
 models/rl/*.pt
 models/rl/*.onnx
 
+# Generated C deployment files
+deploy/generated/
+
 # Results (regenerable)
 results/charts/
 results/*.csv
