@@ -125,3 +125,108 @@ The final model will likely have better evaluation performance than the mid-trai
 1. **Retrain with features masked:** Zero out these 5 features during training so the model learns to ignore them. This gives a model robust to their absence.
 2. **Add fields to kernel task struct:** Extend `struct task` with an optional `struct slm_task_info` pointer, populated by the Rust runtime when creating ML inference tasks. This is the long-term solution described in Plan B.
 3. **Hybrid approach:** Retrain with masked features for initial deployment, then switch to the full-feature model once kernel support is added.
+
+---
+
+## 8. Ablation Studies
+
+**Plan reference:** Section 8.4
+
+The plan specifies four ablation studies that have not been implemented:
+
+1. **State features:** Remove feature groups (per-core, per-task, global) and measure impact on DCR/latency
+2. **Reward weights:** Vary w_deadline, w_latency, w_balance, w_power and plot Pareto frontier
+3. **Model size:** Test MLP variants (64, 128, 256, 512 hidden neurons) for latency-accuracy tradeoff
+4. **Action space:** Compare flat N-way classification vs decomposed 3-classifier cascade
+
+No ablation infrastructure exists yet. Would need evaluation framework (item 1) running first, then scripts to retrain with modified configurations and compare.
+
+---
+
+## 9. Out-of-Distribution Test Scenarios
+
+**Plan reference:** Section 8.2
+
+The plan describes two novel OOD scenarios not present in the codebase:
+
+- **`cascading_failure`:** A component crash triggers load spikes on remaining cores, testing recovery behavior
+- **`model_swap`:** Hot-swap of ML model mid-episode (model size changes), testing adaptation
+
+The existing 8 scenarios in `slm_sim/workloads/scenarios.py` cover normal operating conditions. These OOD scenarios would test robustness to failure modes not seen during training.
+
+Additionally, `burst_storm` was intended to be held out from MLP/XGBoost training as an OOD generalization test, but was included in the training data.
+
+---
+
+## 10. PPO Reward Shaping
+
+**Plan reference:** Section 7.3
+
+The plan describes two auxiliary reward signals for PPO that are not implemented:
+
+- **Step penalty:** -0.001 per scheduling step (encourages faster decisions)
+- **Exploration bonus:** +0.05 for choosing a core not used in the last 5 decisions (encourages action diversity)
+
+Currently, PPO uses only the base 4-component reward from `slm_sim/reward.py`. Adding these could improve RL convergence speed and action space exploration.
+
+---
+
+## 11. INT8 Quantization
+
+**Plan reference:** Sections 4.1, 9.2
+
+The plan describes an export path: PyTorch → ONNX → INT8 quantization → C inference. Currently, all exports are FP32.
+
+INT8 quantization would:
+- Reduce weight size from ~515 KB to ~131 KB per model
+- Reduce inference latency (important if scalar FP at ~87us exceeds the 50us target)
+- Require validation that quantization doesn't degrade action accuracy
+
+ONNX Runtime provides post-training quantization tools. Would need a calibration dataset (subset of validation data) and accuracy verification after quantization.
+
+---
+
+## 12. Behavioral Cloning Pre-training for PPO
+
+**Plan reference:** Section 7.3
+
+`pretrain_behavioral_cloning()` exists in `training/rl/train.py` but is not called by the training pipeline (`train_ppo()` or `_train_ppo.py`). The plan specifies initializing the actor network with 10 epochs of behavioral cloning before PPO exploration begins.
+
+Integrating this into the pipeline could significantly reduce PPO's initial exploration phase, where it makes near-random decisions. The function exists and works (tested), but needs to be wired into `_train_ppo.py` before `train_ppo()` is called.
+
+---
+
+## 13. SHAP Interpretability for XGBoost
+
+**Plan reference:** Section 7.2
+
+The plan mentions SHAP (SHapley Additive exPlanations) analysis for per-sample decision explanations on the XGBoost model. The `shap` package is in `requirements.txt` but no SHAP analysis code exists.
+
+Basic feature importance is implemented (`get_feature_importance()` in `training/xgboost/train.py`), but SHAP provides richer per-decision explanations showing which features pushed toward which action.
+
+---
+
+## 14. Fallback Rate Tracking
+
+**Plan reference:** Section 9.3
+
+When deployed in the kernel, invalid AI actions (e.g., assigning to an offline core, GPU target when unavailable) should fall back to the heuristic scheduler. The plan specifies:
+
+- Tracking the fallback rate as a runtime metric
+- If rate exceeds 5%, flagging the model for retraining
+
+No fallback detection or rate tracking exists in the current C API or evaluation framework. This should be implemented in the kernel-side integration (Plan B) and validated during QEMU testing.
+
+---
+
+## 15. Analysis Notebooks
+
+**Plan reference:** Section 12
+
+Three Jupyter notebooks were planned but not created:
+
+- `notebooks/dataset_analysis.ipynb` — Distribution of rewards, actions, features across experts/scenarios
+- `notebooks/xgboost_shap.ipynb` — SHAP analysis of XGBoost decisions
+- `notebooks/rl_policy_analysis.ipynb` — PPO learning curves, curriculum phase transitions, policy behavior visualization
+
+These are useful for understanding model behavior and presenting results but are not required for deployment.
