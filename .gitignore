@@ -37,9 +37,9 @@ models/rl/*.onnx
 # Generated C deployment files
 deploy/generated/
 
-# Results (regenerable)
-results/charts/
-results/*.csv
+# Results (regenerable — baseline results committed, future runs optional)
+# results/charts/
+# results/*.csv
 
 # Jupyter
 .ipynb_checkpoints/
