@@ -74,17 +74,9 @@ best_pre_params = optuna_search(..., classifier_name="preempt")
 
 ---
 
-## 4. Re-export PPO After Training Completes
+## 4. ~~Re-export PPO After Training Completes~~ (DONE)
 
-**Status:** PPO training is at ~70% (3.5M/5M steps). Current export uses a mid-training checkpoint.
-
-**Action needed:** Once `train_all.py` finishes, re-run:
-```bash
-python scripts/export_models.py --model ppo --platform jetson_orin_nano
-cd deploy/generated && gcc -O2 -o verify_ppo verify_inference_ppo.c ai_weights_ppo.c -lm && ./verify_ppo
-```
-
-The final model will likely have better evaluation performance than the mid-training snapshot, especially on harder scenarios (curriculum phases C and D).
+Completed 2026-04-07. Final PPO model exported with 42 actions (full Jetson action space including GPU target), 132,010 params, ~516 KB. Host-side C verification: 1000/1000 bit-exact.
 
 ---
 
