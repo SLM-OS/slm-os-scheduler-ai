@@ -33,6 +33,9 @@ models/xgboost/*.json
 models/xgboost/*.c
 models/rl/*.pt
 models/rl/*.onnx
+models/ppo/*.zip
+models/ppo/checkpoints/
+models/ppo/logs/
 
 # Generated C deployment files
 deploy/generated/
