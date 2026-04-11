@@ -184,6 +184,7 @@ Unlike MLP/XGBoost which imitate experts, PPO learns by trial and error in the s
 | **Can exceed experts?** | No | No | Yes |
 | **Training time** | Minutes | Minutes | Hours |
 | **Inference** | 1 forward pass | 3 tree traversals | 1 forward pass (actor) |
-| **Parameters** | ~131K | N/A (tree nodes) | ~164K (actor+critic) |
+| **Parameters** | ~132K | N/A (tree nodes) | ~164K (actor+critic) |
 | **Interpretability** | Low | High (feature importance) | Low |
-| **Export size** | ~515 KB | ~6.3 MB | ~515 KB |
+| **Export size** | ~516 KB | N/A (not deployed) | ~516 KB |
+| **Deployed to kernel?** | Yes | No (24 MB too large) | Yes |

@@ -36,6 +36,7 @@ class SchedulerDataset(Dataset):
         self,
         parquet_path: Path | str,
         experts: Optional[set[str]] = None,
+        platform: Optional[str] = None,
         normalization_path: Optional[Path | str] = None,
         max_rows: Optional[int] = None,
         seed: int = 42,
@@ -44,6 +45,8 @@ class SchedulerDataset(Dataset):
         Args:
             parquet_path: Path to a single Parquet file (e.g., train.parquet).
             experts: Set of expert names to include. None = TRAINING_EXPERTS.
+            platform: Filter to specific platform (e.g., 'jetson_orin_nano').
+                None = all platforms.
             normalization_path: Path to normalization.json for z-score normalization.
                 If None, states are used as-is (already in [0,1]).
             max_rows: If set, randomly subsample to at most this many rows.
@@ -61,12 +64,23 @@ class SchedulerDataset(Dataset):
             + ["action", "reward", "expert_policy"]
         )
 
-        # Pass 1: count rows per expert to know final array size
+        # Pass 1: count rows matching expert + platform filters
+        filter_cols = ["expert_policy"]
+        if platform is not None:
+            filter_cols.append("platform")
+
         total_expert_rows = 0
         for i in range(pf.metadata.num_row_groups):
-            rg = pf.read_row_group(i, columns=["expert_policy"])
+            rg = pf.read_row_group(i, columns=filter_cols)
             experts_in_group = rg.column("expert_policy").to_pylist()
-            total_expert_rows += sum(1 for e in experts_in_group if e in filter_experts)
+            if platform is not None:
+                platforms_in_group = rg.column("platform").to_pylist()
+                total_expert_rows += sum(
+                    1 for e, p in zip(experts_in_group, platforms_in_group)
+                    if e in filter_experts and p == platform
+                )
+            else:
+                total_expert_rows += sum(1 for e in experts_in_group if e in filter_experts)
             del rg
 
         if total_expert_rows == 0:
@@ -92,10 +106,14 @@ class SchedulerDataset(Dataset):
         write_pos = 0
 
         # Pass 2: stream row groups and fill arrays
+        read_cols = needed_cols if platform is None else needed_cols + ["platform"]
         for i in range(pf.metadata.num_row_groups):
-            rg = pf.read_row_group(i, columns=needed_cols)
+            rg = pf.read_row_group(i, columns=read_cols)
             expert_col = rg.column("expert_policy").to_pylist()
             mask = np.array([e in filter_experts for e in expert_col])
+            if platform is not None:
+                platform_col = rg.column("platform").to_pylist()
+                mask &= np.array([p == platform for p in platform_col])
 
             if mask.sum() == 0:
                 del rg

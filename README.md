@@ -2,7 +2,7 @@
 
 An AI-driven process scheduler for [SLM-OS](https://github.com/your-org/CS-496-Capstone-SLM-Operating-System), replacing hand-tuned heuristics with learned policies that optimize deadline compliance, inference latency, power efficiency, and core utilization simultaneously.
 
-The system comprises a discrete-event scheduling simulator, synthetic training dataset generation from expert policies, three trained scheduling models (MLP, XGBoost, PPO), and an integration path back into SLM-OS's Rust/C runtime.
+The system comprises a discrete-event scheduling simulator, synthetic training dataset generation from expert policies, three trained scheduling models (MLP, XGBoost, PPO), and a C export pipeline for integration into SLM-OS's Rust/C runtime. MLP and PPO are exported for kernel deployment (~516 KB each); XGBoost is used for training-time analysis only.
 
 ## Architecture
 
@@ -53,10 +53,10 @@ slm-os-scheduler-ai/
 │   ├── generate_dataset.py   #   Full dataset generation orchestrator
 │   ├── validate_dataset.py   #   NaN/range/completeness checks
 │   ├── split_dataset.py      #   70/15/15 episode-level split + normalization
-│   └── export_models.py      #   ONNX + C weight export (stub)
+│   └── export_models.py      #   C weight export (MLP + PPO)
 ├── deploy/
 │   └── ai_scheduler.h        # C API header for SLM-OS kernel integration
-├── tests/                    # 204 tests across 17 files
+├── tests/                    # 224 tests across 18 files
 ├── pyproject.toml
 └── requirements.txt
 ```

@@ -4,25 +4,11 @@ Potential improvements that are implemented but not yet exercised, or known issu
 
 ---
 
-## 1. Run Full Evaluation Suite
+## ~~1. Run Full Evaluation Suite~~ (DONE)
 
-The evaluation framework (`evaluation/`) is complete but hasn't been run against the trained models.
+Completed 2026-04-07. Ran 7 agents (MLP, PPO, XGBoost, hybrid, EDF, weighted, random) × 8 scenarios × 200 episodes = 11,200 episodes. Results in `results/`.
 
-**What it does:** Runs all agents (MLP, XGBoost, PPO, plus expert baselines) on identical test episodes with paired random seeds, computes DCR/latency/balance/power metrics, and runs paired t-tests for statistical significance.
-
-**How to run:**
-```python
-from evaluation.run_eval import run_full_evaluation, summarize_results
-from evaluation.statistical_tests import run_all_comparisons
-from evaluation.visualization import generate_all_charts
-
-results = run_full_evaluation()
-summary = summarize_results(results)
-comparisons = run_all_comparisons(results, baseline="slm_os_hybrid")
-generate_all_charts(results, output_dir="results/charts/")
-```
-
-**Why it matters:** Without this, we don't have quantitative evidence of how the trained models compare to the expert baselines. The MLP's 90.4% val accuracy and XGBoost's 93.4% core accuracy are training metrics — evaluation on held-out test scenarios with proper metrics (DCR, latency, etc.) is the real measure.
+**Key findings:** MLP dominated among trained models (99.3% DCR on medium_mixed vs 92.7% PPO, 97.0% XGBoost). Statistically significant but small gap from hybrid baseline on hardest 3 scenarios (0.7-0.9% lower DCR). See `results/eval_summary.csv` and `results/charts/`.
 
 ---
 
@@ -80,30 +66,17 @@ Completed 2026-04-07. Final PPO model exported with 42 actions (full Jetson acti
 
 ---
 
-## 5. Action Space Mismatch
+## ~~5. Action Space Mismatch~~ (RESOLVED)
 
-**Issue:** The MLP was trained on data from all 3 platforms (Jetson/Pi5/big.LITTLE) subsampled together. The resulting model has 36 output actions — matching big.LITTLE's action space (6 cores, no GPU, 6x3x2=36) — rather than Jetson's 42 (7 targets including GPU).
+Resolved 2026-04-11 via platform-specific training. `SchedulerDataset` now accepts a `platform` parameter to filter training data. `_train_mlp.py --platform jetson_orin_nano` computes the platform's full action space (42) and passes it to `train_mlp(n_actions=42)`, ensuring the model output dimension matches even if experts never use all actions (e.g., GPU target).
 
-**Impact:** The model cannot select the GPU target on Jetson (actions 36-41 don't exist in its output). Core assignments 0-5 and all priority/preempt combinations work fine.
-
-**Fix options:**
-1. **Retrain with Jetson-only data:** Filter the training Parquet to `platform == "jetson_orin_nano"` before loading. This gives the full 42-action output but loses cross-platform generalization.
-2. **Retrain with all data but pad actions:** Ensure the training set includes at least one sample of each action index up to the platform's maximum.
-3. **Accept 36 actions:** If GPU offload isn't critical, the 36-action model still covers all CPU core assignments and priority/preempt decisions.
+Jetson-specific MLP trained and exported: 42 actions, 88.8% val accuracy, 1000/1000 bit-exact C verification. Checkpoint at `models/mlp/best_jetson_orin_nano.pt`.
 
 ---
 
-## 6. XGBoost Export Size
+## ~~6. XGBoost Export Size~~ (DROPPED)
 
-**Issue:** The exported XGBoost model is ~6.3 MB (462K tree nodes across 1400 trees). This is likely too large for bare-metal kernel `.rodata`.
-
-**MLP and PPO are ~515 KB each** — much more practical for deployment.
-
-**Options if XGBoost deployment is desired:**
-1. **Reduce tree count/depth** via Optuna search (see item 3). Fewer, shallower trees = smaller export.
-2. **Prune trees** post-training by removing low-importance nodes.
-3. **Use treelite** for C codegen instead of the interpretive traversal — produces if/else chains that may be more compact after compiler optimization.
-4. **Skip XGBoost for deployment** and use MLP or PPO instead. XGBoost's main advantage (interpretability via feature importance) is a training-time benefit, not a deployment requirement.
+XGBoost export produced 24 MB of tree node data (462K nodes across 1,400 trees) — far too large for bare-metal kernel `.rodata`. Evaluation also showed XGBoost (97.0% DCR) underperforming MLP (99.3%). XGBoost dropped from kernel integration; export pipeline now only supports MLP and PPO. XGBoost remains available for training and analysis but is not deployed.
 
 ---
 

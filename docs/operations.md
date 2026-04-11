@@ -66,8 +66,13 @@ Runs three stages in **separate subprocesses** (memory isolation):
 
 Each stage uses at most ~10M rows (subsampled from ~80M total) to fit in RAM.
 
+For platform-specific MLP (required for deployment):
+```bash
+python scripts/_train_mlp.py --platform jetson_orin_nano
+```
+
 **Models saved to:**
-- `models/mlp/best.pt`
+- `models/mlp/best.pt` (mixed-platform) or `models/mlp/best_{platform}.pt`
 - `models/xgboost/{core,priority,preempt}_clf.json` + `meta.json`
 - `models/ppo/best_model.zip` + `models/ppo/checkpoints/`
 

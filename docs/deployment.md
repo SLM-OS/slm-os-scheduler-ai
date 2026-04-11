@@ -16,11 +16,10 @@ python scripts/export_models.py --model all --platform jetson_orin_nano \
 
 | File | Contents |
 |------|----------|
-| `ai_config.h` | `AI_SCHED_STATE_SIZE` (108), `AI_SCHED_N_ACTIONS` (platform-dependent) |
+| `ai_config.h` | Constants, `ai_sched_action` struct, `ai_decode_action()` inline function |
 | `ai_weights_mlp.h` | Extern declarations for MLP weight arrays |
 | `ai_weights_mlp.c` | Weight arrays as `static const float[]` with hex float literals |
 | `ai_weights_ppo.h/c` | Same for PPO actor weights |
-| `ai_xgboost_trees.h/c` | Tree node arrays for 3 XGBoost classifiers |
 | `verify_inference_*.c` | Host-side C verification test |
 | `test_vectors_*.bin` | 1000 test state vectors |
 | `expected_actions_*.bin` | Expected action indices |
@@ -55,7 +54,7 @@ This eliminates BatchNorm from inference entirely, leaving 4 simple layers:
 Layer 0: W[256x108], b[256] → ReLU
 Layer 1: W[256x256], b[256] → ReLU   (BN folded in)
 Layer 2: W[128x256], b[128] → ReLU   (BN folded in)
-Layer 3: W[36x128],  b[36]           (BN folded in, no activation)
+Layer 3: W[42x128],  b[42]           (BN folded in, no activation)
 ```
 
 Verification: 1000/1000 test inputs produce identical argmax actions before and after folding.
@@ -73,25 +72,21 @@ features_extractor (identity) → shared[0] (Linear 108→256) → ReLU
 
 No BatchNorm, so extraction is exact (zero diff).
 
-## XGBoost Export
+## Action Decoding
 
-Three classifiers exported as compact tree node arrays:
+`ai_config.h` includes an inline function that converts a raw action index to a structured action:
 
 ```c
-struct xgb_node {
-    int16_t  feature_idx;   // -1 = leaf
-    float    threshold;      // split threshold
-    float    leaf_value;     // leaf output (if leaf)
-    uint16_t left_child;     // index of left child
-    uint16_t right_child;    // index of right child
-};
+static inline void ai_decode_action(int idx, struct ai_sched_action *out) {
+    out->preempt        = idx % 2;  idx /= 2;
+    out->priority_adj   = idx % 3;  idx /= 3;
+    out->core_assignment = idx;
+}
 ```
 
-Also exports:
-- Tree offset/size tables for locating individual trees in the flat array
-- Label encoder mappings (`xgb_*_label_map[]`) for decoding predictions back to kernel priority values
+This matches the Python encoding in `slm_sim/actions.py`: `idx = core * 6 + priority_adj * 2 + preempt`.
 
-**Size warning:** The current XGBoost model produces ~462K nodes (~6.3 MB), which may be too large for a bare-metal kernel. MLP/PPO at ~515 KB each are better candidates for initial deployment.
+**Note:** XGBoost export was dropped — the model produced 24 MB of tree node data (462K nodes), too large for bare-metal `.rodata`. MLP and PPO at ~515 KB each are the deployment targets.
 
 ## C Inference Engine
 
@@ -160,16 +155,22 @@ The kernel calls `ai_schedule()` at each scheduling decision point, passing the 
 
 | Model | Parameters | .rodata Size |
 |-------|-----------|-------------|
-| MLP (BN-folded) | 131,236 | ~513 KB |
+| MLP (BN-folded) | 132,010 | ~516 KB |
 | PPO (actor only) | 132,010 | ~516 KB |
-| XGBoost (3 classifiers) | 462,412 nodes | ~6.3 MB |
 
-## Action Space Mismatch
+## Platform-Specific Training
 
-The training dataset includes data from all 3 platforms. The MLP was trained with `n_actions = max(action_index) + 1` from the subsampled data, which may differ from the target platform's theoretical action space. The export script detects this and reports it:
+Models must be trained on platform-specific data so the output dimension matches the platform's action space. For Jetson Orin Nano (42 actions):
+
+```bash
+python scripts/_train_mlp.py --platform jetson_orin_nano
+```
+
+This filters the training data to Jetson-only rows and sets `n_actions=42` from the platform definition (even if experts never use all actions, e.g., GPU target). The export script validates the match and refuses to export if mismatched:
 
 ```
-NOTE: model was trained with 36 actions (platform wants 42)
+ERROR: model best.pt has 36 actions but platform jetson_orin_nano requires 42
+Retrain with: python scripts/_train_mlp.py --platform jetson_orin_nano
 ```
 
-For deployment on a specific platform, retrain with data from that platform only, or ensure the training data includes the full action range.
+The export script prefers `best_{platform}.pt` over `best.pt` when both exist.

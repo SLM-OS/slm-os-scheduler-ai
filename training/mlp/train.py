@@ -60,6 +60,7 @@ def train_mlp(
     val_dataset: SchedulerDataset,
     config: TrainConfig = TrainConfig(),
     save_path: Optional[Path] = None,
+    n_actions: Optional[int] = None,
 ) -> tuple[SchedulerMLP, TrainResult]:
     """Train the MLP scheduler model.
 
@@ -68,14 +69,16 @@ def train_mlp(
         val_dataset: Validation data.
         config: Training configuration.
         save_path: Where to save the best model checkpoint.
+        n_actions: Explicit action space size. If None, inferred from data.
 
     Returns:
         Tuple of (trained model, training results).
     """
     device = torch.device(config.device)
-    n_actions = max(train_dataset.n_actions, val_dataset.n_actions)
-    if n_actions == 0:
-        n_actions = 42  # default Jetson
+    if n_actions is None:
+        n_actions = max(train_dataset.n_actions, val_dataset.n_actions)
+        if n_actions == 0:
+            n_actions = 42  # default Jetson
 
     model = SchedulerMLP(
         n_features=train_dataset.n_features,
