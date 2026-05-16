@@ -387,9 +387,20 @@ def write_nn_weights_c(
     layers: list[tuple[torch.Tensor, torch.Tensor]],
     model_name: str,
     output_dir: Path,
+    *,
+    file_suffix: str = "",
 ) -> None:
-    """Write neural network weights as C source and header files."""
+    """Write neural network weights as C source and header files.
+
+    The optional `file_suffix` distinguishes parallel weight sets
+    (e.g., synthetic-trained vs SLM-OS-fine-tuned) on disk. With
+    `file_suffix="_real"`, output goes to `ai_weights_<model>_real.c`
+    while the C symbol names (`mlp_w0`, `mlp_b0`, …) stay unchanged —
+    the kernel build flag `AI_WEIGHTS=synthetic|real` (#884) picks
+    one .c file and the symbols resolve identically either way.
+    """
     prefix = model_name  # e.g., "mlp" or "ppo"
+    name_with_suffix = f"{prefix}{file_suffix}"
 
     # Header file
     h_lines = [
@@ -411,6 +422,10 @@ def write_nn_weights_c(
     h_lines.append(f"#endif /* AI_WEIGHTS_{prefix.upper()}_H */")
     h_lines.append("")
 
+    # Header: identical content across suffixes (same symbol decls);
+    # one canonical .h shared by both .c variants. Written
+    # unconditionally so a `--weights-suffix _real` standalone export
+    # still produces the header the .c file includes.
     (output_dir / f"ai_weights_{prefix}.h").write_text("\n".join(h_lines))
 
     # Source file
@@ -436,7 +451,7 @@ def write_nn_weights_c(
         c_lines.append("};")
         c_lines.append("")
 
-    (output_dir / f"ai_weights_{prefix}.c").write_text("\n".join(c_lines))
+    (output_dir / f"ai_weights_{name_with_suffix}.c").write_text("\n".join(c_lines))
 
 
 def _write_float_array(lines: list[str], arr: np.ndarray, cols: int = 4) -> None:
@@ -1072,20 +1087,44 @@ int main(void) {{
 # Main
 # ---------------------------------------------------------------------------
 
-def export_mlp(platform_name: str, n_actions: int, output_dir: Path) -> None:
-    """Export MLP model with BatchNorm folding."""
+def export_mlp(
+    platform_name: str,
+    n_actions: int,
+    output_dir: Path,
+    *,
+    checkpoint: Path | None = None,
+    file_suffix: str = "",
+) -> None:
+    """Export MLP model with BatchNorm folding.
+
+    `checkpoint` overrides the default `models/mlp/best_<platform>.pt`
+    lookup — used by the SLM-OS-trace fine-tune flow (#879) to point
+    at `models/mlp/best_<platform>_real.pt`. `file_suffix` (e.g.,
+    "_real") tags the generated `.c` filename so synthetic and real
+    weight sets coexist on disk without clobbering each other.
+    """
     from training.mlp.model import SchedulerMLP
 
-    # Prefer platform-specific model, fall back to generic
-    platform_path = Path(f"models/mlp/best_{platform_name}.pt")
-    generic_path = Path("models/mlp/best.pt")
-    if platform_path.exists():
-        model_path = platform_path
-    elif generic_path.exists():
-        model_path = generic_path
+    if checkpoint is not None:
+        if not checkpoint.exists():
+            # Explicit-checkpoint mismatches mean the operator made a
+            # typo or pointed at a stale path — exit non-zero rather
+            # than silently produce nothing. The baseline-lookup branch
+            # below uses SKIP because "no model trained yet" is a
+            # legitimate state during incremental development.
+            sys.exit(f"export-mlp: --weights-checkpoint {checkpoint} does not exist")
+        model_path = checkpoint
     else:
-        print(f"  SKIP: no MLP model found ({platform_path} or {generic_path})")
-        return
+        # Prefer platform-specific model, fall back to generic
+        platform_path = Path(f"models/mlp/best_{platform_name}.pt")
+        generic_path = Path("models/mlp/best.pt")
+        if platform_path.exists():
+            model_path = platform_path
+        elif generic_path.exists():
+            model_path = generic_path
+        else:
+            print(f"  SKIP: no MLP model found ({platform_path} or {generic_path})")
+            return
 
     # Detect output dimension from checkpoint
     state_dict = torch.load(model_path, weights_only=True, map_location="cpu")
@@ -1111,20 +1150,36 @@ def export_mlp(platform_name: str, n_actions: int, output_dir: Path) -> None:
         print(f"  WARNING: large folding difference ({max_diff:.2e}), proceeding anyway")
 
     # Write C files
-    write_nn_weights_c(layers, "mlp", output_dir)
+    write_nn_weights_c(layers, "mlp", output_dir, file_suffix=file_suffix)
     generate_verification_data(layers, "mlp", output_dir)
     write_verify_c(output_dir, "mlp", n_actions)
 
     total_params = sum(W.numel() + b.numel() for W, b in layers)
-    print(f"  MLP exported: {total_params} params, ~{total_params * 4 / 1024:.0f} KB")
+    suffix_note = f" [suffix={file_suffix}]" if file_suffix else ""
+    print(f"  MLP exported{suffix_note}: {total_params} params, "
+          f"~{total_params * 4 / 1024:.0f} KB")
 
 
-def export_ppo(platform_name: str, n_actions: int, output_dir: Path) -> None:
+def export_ppo(
+    platform_name: str,
+    n_actions: int,
+    output_dir: Path,
+    *,
+    checkpoint: Path | None = None,
+    file_suffix: str = "",
+) -> None:
     """Export PPO actor network."""
-    model_path = Path("models/ppo/best_model.zip")
-    if not model_path.exists():
-        print(f"  SKIP: {model_path} not found (training may still be running)")
-        return
+    if checkpoint is not None:
+        if not checkpoint.exists():
+            # Same rationale as export_mlp: explicit-checkpoint typo is
+            # a hard error, baseline lookup miss is a soft SKIP.
+            sys.exit(f"export-ppo: --weights-checkpoint {checkpoint} does not exist")
+        model_path = checkpoint
+    else:
+        model_path = Path("models/ppo/best_model.zip")
+        if not model_path.exists():
+            print(f"  SKIP: {model_path} not found (training may still be running)")
+            return
 
     layers = extract_ppo_actor_layers(model_path)
     max_diff = verify_ppo_actor(model_path, layers)
@@ -1136,12 +1191,14 @@ def export_ppo(platform_name: str, n_actions: int, output_dir: Path) -> None:
         print(f"  ERROR: PPO output dim ({out_dim}) != platform actions ({n_actions})")
         return
 
-    write_nn_weights_c(layers, "ppo", output_dir)
+    write_nn_weights_c(layers, "ppo", output_dir, file_suffix=file_suffix)
     generate_verification_data(layers, "ppo", output_dir)
     write_verify_c(output_dir, "ppo", n_actions)
 
     total_params = sum(W.numel() + b.numel() for W, b in layers)
-    print(f"  PPO exported: {total_params} params, ~{total_params * 4 / 1024:.0f} KB")
+    suffix_note = f" [suffix={file_suffix}]" if file_suffix else ""
+    print(f"  PPO exported{suffix_note}: {total_params} params, "
+          f"~{total_params * 4 / 1024:.0f} KB")
 
 
 def export_xgboost(
@@ -1195,7 +1252,26 @@ def main():
         help="(debug) Also emit the XGBoost cascade as legacy C source. "
              "Default off; ~24 MB of C is large and not shipped.",
     )
+    parser.add_argument(
+        "--weights-checkpoint", type=Path, default=None,
+        help="(#879) Override the default model checkpoint lookup. Used "
+             "by the SLM-OS-trace fine-tune flow to export weights from "
+             "an arbitrary `.pt` (or `.zip` for PPO) rather than "
+             "`models/<arch>/best_<platform>.pt`. Implies one model at a "
+             "time; pair with --model.",
+    )
+    parser.add_argument(
+        "--weights-suffix", type=str, default="",
+        help="(#879) Tag for the generated .c filename (e.g., '_real'). "
+             "Empty string (default) produces `ai_weights_mlp.c` — the "
+             "synthetic baseline shape. Non-empty produces "
+             "`ai_weights_mlp<suffix>.c` so synthetic and fine-tuned "
+             "weight sets coexist on disk.",
+    )
     args = parser.parse_args()
+
+    if args.weights_checkpoint is not None and args.model == "all":
+        sys.exit("--weights-checkpoint requires a single --model (mlp|ppo|xgboost)")
 
     output_dir = Path(args.output_dir) if args.output_dir else (
         Path(__file__).resolve().parent.parent / "deploy" / "generated"
@@ -1217,10 +1293,21 @@ def main():
     for model_name in models:
         print(f"--- Exporting {model_name.upper()} ---")
         if model_name == "mlp":
-            export_mlp(args.platform, n_actions, output_dir)
+            export_mlp(args.platform, n_actions, output_dir,
+                       checkpoint=args.weights_checkpoint,
+                       file_suffix=args.weights_suffix)
         elif model_name == "ppo":
-            export_ppo(args.platform, n_actions, output_dir)
+            export_ppo(args.platform, n_actions, output_dir,
+                       checkpoint=args.weights_checkpoint,
+                       file_suffix=args.weights_suffix)
         elif model_name == "xgboost":
+            # XGBoost cascade exports use a binary blob, not C source —
+            # the --weights-suffix flag is a no-op here. The fine-tune
+            # path (#879) is only wired for MLP / PPO in v1; XGBoost
+            # fine-tune from a small SLM-OS capture is out of scope.
+            if args.weights_suffix:
+                print(f"  NOTE: --weights-suffix ignored for xgboost "
+                      f"(binary blob, not C source)")
             export_xgboost(
                 args.platform, n_actions, output_dir,
                 emit_c_source=args.xgb_emit_c_source,

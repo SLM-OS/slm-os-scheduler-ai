@@ -36,4 +36,7 @@ include = ["slm_sim*", "training*", "evaluation*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-v --tb=short"
+addopts = "-v --tb=short -m 'not slow'"
+markers = [
+    "slow: end-to-end tests that train a model (10-30s each). Run with `pytest -m slow`.",
+]

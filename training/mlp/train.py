@@ -61,6 +61,7 @@ def train_mlp(
     config: TrainConfig = TrainConfig(),
     save_path: Optional[Path] = None,
     n_actions: Optional[int] = None,
+    pretrained_state: Optional[dict] = None,
 ) -> tuple[SchedulerMLP, TrainResult]:
     """Train the MLP scheduler model.
 
@@ -70,6 +71,10 @@ def train_mlp(
         config: Training configuration.
         save_path: Where to save the best model checkpoint.
         n_actions: Explicit action space size. If None, inferred from data.
+        pretrained_state: Optional torch state_dict to load into the model
+            before training begins. Used by the SLM-OS-trace fine-tune
+            flow (#879) so adaptation starts from the synthetic-trained
+            checkpoint rather than random init. None = train from scratch.
 
     Returns:
         Tuple of (trained model, training results).
@@ -88,6 +93,20 @@ def train_mlp(
         hidden3=config.hidden3,
         dropout=config.dropout,
     ).to(device)
+
+    if pretrained_state is not None:
+        # Fine-tune mode (#879): start from a checkpoint's weights so
+        # we adapt rather than retrain. strict=True so an architectural
+        # mismatch (different n_actions, hidden sizes, layer rename)
+        # raises here rather than silently leaving a layer randomly
+        # initialized. Callers are expected to keep the architecture
+        # consistent between synthetic baseline and fine-tune target —
+        # for v1, fine-tune only on platforms where the baseline already
+        # ships at the same dims. If the caller deliberately wants to
+        # adapt across architectures, they can re-shape the state_dict
+        # before passing it in.
+        model.load_state_dict(pretrained_state, strict=True)
+        print("  (pretrained load: ok)", flush=True)
 
     optimizer = AdamW(
         model.parameters(),
