@@ -209,11 +209,44 @@ def export_xgboost_trees(model_dir: Path) -> dict:
     Returns dict with keys: core, priority, preempt.
     Each value is a dict with 'nodes' (list of list of node dicts) and
     'label_classes' (list of original label values).
+
+    Prepends one synthetic single-leaf "base-margin" tree per class to
+    fold XGBoost's `base_score` offset into the tree-walk output. The
+    runtime walker sums every tree and either thresholds at 0 (binary)
+    or argmaxes per-class scores (multiclass) — it has no separate
+    base-margin term. Without this fold, predictions diverge from
+    `XGBClassifier.predict` whenever `base_score != 0.5` (binary) or
+    when any per-class base differs (multiclass). Preempt was the
+    worst offender — `base_score ≈ 0.0023`, logit ≈ -6.1, large enough
+    to flip most decisions to class 1 when ignored. See SLM-OS #920.
+
+    The synthetic trees are prepended in `class 0, class 1, …` order
+    so the runtime's `tree_index % n_classes` rotation maps each
+    synthetic tree to its intended class.
     """
+    import math
     import xgboost as xgb
 
     with open(model_dir / "meta.json") as f:
         meta = json.load(f)
+
+    def _logit(p: float) -> float:
+        # Clamp away from {0, 1} so log() stays finite even when a
+        # poorly-balanced training set yields a near-degenerate base.
+        eps = 1e-12
+        p = max(min(p, 1.0 - eps), eps)
+        return math.log(p / (1.0 - p))
+
+    def _synth_leaf_tree(value: float) -> list:
+        # Single-node tree matching the on-disk leaf shape produced by
+        # `_flatten_tree` for `{"leaf": value}` JSON nodes.
+        return [{
+            "feature_idx": -1,
+            "threshold": 0.0,
+            "leaf_value": float(value),
+            "left_child": 0,
+            "right_child": 0,
+        }]
 
     result = {}
     for name, clf_file, classes_key in [
@@ -234,9 +267,40 @@ def export_xgboost_trees(model_dir: Path) -> dict:
             _flatten_tree(tree, nodes)
             all_trees.append(nodes)
 
+        # Build per-class base-margin contribution. XGBoost stores
+        # `base_score` as a single probability for binary:logistic and
+        # as an n_classes-long margin vector for multi:softprob.
+        cfg = json.loads(booster.save_config())
+        bs_raw = cfg["learner"]["learner_model_param"].get("base_score", "0.5")
+        n_classes = len(meta[classes_key])
+        if isinstance(bs_raw, str) and bs_raw.startswith("["):
+            bs_vec = [float(x) for x in bs_raw.strip("[]").split(",")]
+        else:
+            bs_vec = [float(bs_raw)]
+
+        if len(bs_vec) == n_classes:
+            # Multiclass: per-class margin offsets, store as-is.
+            base_margins = bs_vec
+        elif n_classes == 2 and len(bs_vec) == 1:
+            # Binary:logistic stores a single base_score probability
+            # (e.g. 0.0023 for preempt, 0.4162 for priority). The
+            # class-1 margin offset is logit(p); class 0 stays at 0.
+            # Prepending two synthetic trees keeps the runtime's
+            # `i % n_classes` rotation aligned (tree 0 → class 0,
+            # tree 1 → class 1).
+            base_margins = [0.0, _logit(bs_vec[0])]
+        else:
+            raise ValueError(
+                f"{name}: base_score length {len(bs_vec)} not compatible "
+                f"with n_classes {n_classes}"
+            )
+
+        synth_trees = [_synth_leaf_tree(m) for m in base_margins]
+        all_trees = synth_trees + all_trees
+
         result[name] = {
             "trees": all_trees,
-            "n_classes": len(meta[classes_key]),
+            "n_classes": n_classes,
             "label_classes": meta[classes_key],
         }
 
