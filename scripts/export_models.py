@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import struct
 import sys
 from pathlib import Path
@@ -203,12 +204,59 @@ def verify_ppo_actor(
 # XGBoost export
 # ---------------------------------------------------------------------------
 
+def _xgb_logit(p: float) -> float:
+    """Numerically safe logit, clamping away from {0, 1} so log() stays
+    finite when a poorly-balanced training set yields a near-degenerate
+    base."""
+    eps = 1e-12
+    p = max(min(p, 1.0 - eps), eps)
+    return math.log(p / (1.0 - p))
+
+
+def _xgb_synth_leaf_tree(value: float) -> list:
+    """One-node tree matching the on-disk leaf shape produced by
+    `_flatten_tree` for `{"leaf": value}` JSON nodes."""
+    return [{
+        "feature_idx": -1,
+        "threshold": 0.0,
+        "leaf_value": float(value),
+        "left_child": 0,
+        "right_child": 0,
+    }]
+
+
+def _xgb_parse_base_score(bs_raw) -> list:
+    """Parse XGBoost's `base_score` config field into a list of floats.
+
+    XGBoost serializes it differently depending on the booster: a
+    single string-encoded probability for `binary:logistic`
+    (e.g. `"4.16e-1"`) and a string-encoded JSON-ish array of margins
+    for `multi:softprob` (e.g. `"[7.46e-1,7.46e-1,1.45e-2,...]"`).
+    Try real JSON first so a future XGBoost release that switches to
+    proper JSON arrays or adds whitespace doesn't silently break the
+    fold."""
+    if isinstance(bs_raw, list):
+        return [float(x) for x in bs_raw]
+    if isinstance(bs_raw, (int, float)):
+        return [float(bs_raw)]
+    try:
+        parsed = json.loads(bs_raw)
+    except (json.JSONDecodeError, TypeError):
+        return [float(bs_raw)]
+    if isinstance(parsed, list):
+        return [float(x) for x in parsed]
+    return [float(parsed)]
+
+
 def export_xgboost_trees(model_dir: Path) -> dict:
     """Export XGBoost classifiers to compact node arrays.
 
-    Returns dict with keys: core, priority, preempt.
-    Each value is a dict with 'nodes' (list of list of node dicts) and
-    'label_classes' (list of original label values).
+    Returns dict with keys: core, priority, preempt. Each value is a
+    dict with 'trees' (list of list of node dicts), 'n_classes' (int),
+    and 'label_classes' (list of original label values). The 'trees'
+    list begins with `n_classes` synthetic single-leaf base-margin
+    trees followed by the real per-round trees, so total tree count
+    is `n_classes + booster.num_boosted_rounds() * trees_per_round`.
 
     Prepends one synthetic single-leaf "base-margin" tree per class to
     fold XGBoost's `base_score` offset into the tree-walk output. The
@@ -224,29 +272,10 @@ def export_xgboost_trees(model_dir: Path) -> dict:
     so the runtime's `tree_index % n_classes` rotation maps each
     synthetic tree to its intended class.
     """
-    import math
     import xgboost as xgb
 
     with open(model_dir / "meta.json") as f:
         meta = json.load(f)
-
-    def _logit(p: float) -> float:
-        # Clamp away from {0, 1} so log() stays finite even when a
-        # poorly-balanced training set yields a near-degenerate base.
-        eps = 1e-12
-        p = max(min(p, 1.0 - eps), eps)
-        return math.log(p / (1.0 - p))
-
-    def _synth_leaf_tree(value: float) -> list:
-        # Single-node tree matching the on-disk leaf shape produced by
-        # `_flatten_tree` for `{"leaf": value}` JSON nodes.
-        return [{
-            "feature_idx": -1,
-            "threshold": 0.0,
-            "leaf_value": float(value),
-            "left_child": 0,
-            "right_child": 0,
-        }]
 
     result = {}
     for name, clf_file, classes_key in [
@@ -267,35 +296,32 @@ def export_xgboost_trees(model_dir: Path) -> dict:
             _flatten_tree(tree, nodes)
             all_trees.append(nodes)
 
-        # Build per-class base-margin contribution. XGBoost stores
-        # `base_score` as a single probability for binary:logistic and
-        # as an n_classes-long margin vector for multi:softprob.
+        # Build per-class base-margin contribution.
         cfg = json.loads(booster.save_config())
         bs_raw = cfg["learner"]["learner_model_param"].get("base_score", "0.5")
         n_classes = len(meta[classes_key])
-        if isinstance(bs_raw, str) and bs_raw.startswith("["):
-            bs_vec = [float(x) for x in bs_raw.strip("[]").split(",")]
-        else:
-            bs_vec = [float(bs_raw)]
+        bs_vec = _xgb_parse_base_score(bs_raw)
 
-        if len(bs_vec) == n_classes:
-            # Multiclass: per-class margin offsets, store as-is.
+        # XGBoost binary:logistic stores a single probability that
+        # represents class 1's marginal rate; class 0's margin is 0
+        # by convention. Multi:softprob stores an n_classes-long
+        # margin vector directly. If a future XGBoost release ever
+        # stores binary as a 2-element [1-p, p] probability vector
+        # the `len == n_classes` branch below would treat those as
+        # raw margins — they aren't, so the resulting cascade would
+        # diverge. Today (XGBoost ≤ 3.x) this can't happen; flagged
+        # as the most likely future-incompat regression site.
+        if n_classes == 2 and len(bs_vec) == 1:
+            base_margins = [0.0, _xgb_logit(bs_vec[0])]
+        elif len(bs_vec) == n_classes:
             base_margins = bs_vec
-        elif n_classes == 2 and len(bs_vec) == 1:
-            # Binary:logistic stores a single base_score probability
-            # (e.g. 0.0023 for preempt, 0.4162 for priority). The
-            # class-1 margin offset is logit(p); class 0 stays at 0.
-            # Prepending two synthetic trees keeps the runtime's
-            # `i % n_classes` rotation aligned (tree 0 → class 0,
-            # tree 1 → class 1).
-            base_margins = [0.0, _logit(bs_vec[0])]
         else:
             raise ValueError(
                 f"{name}: base_score length {len(bs_vec)} not compatible "
                 f"with n_classes {n_classes}"
             )
 
-        synth_trees = [_synth_leaf_tree(m) for m in base_margins]
+        synth_trees = [_xgb_synth_leaf_tree(m) for m in base_margins]
         all_trees = synth_trees + all_trees
 
         result[name] = {
