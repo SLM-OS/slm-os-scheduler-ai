@@ -96,17 +96,17 @@ def train_mlp(
 
     if pretrained_state is not None:
         # Fine-tune mode (#879): start from a checkpoint's weights so
-        # we adapt rather than retrain. strict=False so a shape
-        # mismatch (different n_actions / hidden sizes) surfaces here
-        # rather than silently failing later. The caller is expected
-        # to keep the architecture consistent — for v1, fine-tune
-        # only on platforms where the synthetic baseline already
-        # ships at the same dims.
-        missing, unexpected = model.load_state_dict(pretrained_state, strict=False)
-        if missing:
-            print(f"  (pretrained load: {len(missing)} missing keys)", flush=True)
-        if unexpected:
-            print(f"  (pretrained load: {len(unexpected)} unexpected keys)", flush=True)
+        # we adapt rather than retrain. strict=True so an architectural
+        # mismatch (different n_actions, hidden sizes, layer rename)
+        # raises here rather than silently leaving a layer randomly
+        # initialized. Callers are expected to keep the architecture
+        # consistent between synthetic baseline and fine-tune target —
+        # for v1, fine-tune only on platforms where the baseline already
+        # ships at the same dims. If the caller deliberately wants to
+        # adapt across architectures, they can re-shape the state_dict
+        # before passing it in.
+        model.load_state_dict(pretrained_state, strict=True)
+        print("  (pretrained load: ok)", flush=True)
 
     optimizer = AdamW(
         model.parameters(),

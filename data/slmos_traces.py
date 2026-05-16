@@ -121,6 +121,12 @@ class ParsedTrace:
     header: TraceFileHeader
     decisions: list[DecisionRecord] = field(default_factory=list)
     completions: list[CompletionRecord] = field(default_factory=list)
+    # Records whose `kind` byte didn't match KIND_DECISION or
+    # KIND_COMPLETION. Forward-compat for a future SLM-OS format that
+    # adds a new variant (e.g., MIGRATION). Surfacing the count lets
+    # `main()` warn that the ingester is silently dropping records,
+    # which is a hint the format/version pinning needs to move.
+    unknown_records: int = 0
 
 
 def _read_header(blob: bytes) -> TraceFileHeader:
@@ -242,13 +248,22 @@ def parse_trace(blob: bytes) -> ParsedTrace:
         elif kind == KIND_COMPLETION:
             parsed.completions.append(_parse_completion(blob, offset))
         else:
-            # Unknown kind: skip silently. Future versions may add new
-            # variants; SLM-OS docs/sched-trace-format.md will bump the
-            # `version` field if the existing kinds change shape, so an
-            # unknown kind here just means "additional record type we
-            # haven't been taught — drop it."
+            # Unknown kind: skip but count. Future versions may add
+            # new variants; SLM-OS docs/sched-trace-format.md will
+            # bump the `version` field if the existing kinds change
+            # shape, so an unknown kind here just means "additional
+            # record type we haven't been taught." main() surfaces
+            # the count so an operator can tell at a glance.
+            parsed.unknown_records += 1
             continue
     return parsed
+
+
+# Defensive upper bound on action_core. SLM-OS targets max out around
+# 6 cores + 1 GPU slot (Jetson Orin Nano); anything above 16 is almost
+# certainly corrupted trace data and should fail loudly rather than
+# silently propagate into an out-of-range Parquet action column.
+MAX_ACTION_CORE = 16
 
 
 def encode_action_index(action_core: int) -> int:
@@ -263,11 +278,23 @@ def encode_action_index(action_core: int) -> int:
     raise}` triplet (we'd need to know the prior priority).
 
     For fine-tuning, v1 maps `priority_adj = 1` (keep) and `preempt
-    = 0` uniformly: the trace teaches the model only the core-
-    assignment dimension. The synthetic baseline weights still
-    contribute the priority/preempt behaviour. Documented limitation;
-    revisit if/when the SLM-OS trace adds explicit prio_adj capture.
+    = 0` uniformly. Concretely this means the cross-entropy loss will
+    push the model's priority_adj output toward 'keep' on every fine-
+    tune sample, gradually eroding the synthetic baseline's prio /
+    preempt behaviour over many epochs. The v1 config (10 epochs,
+    lr=1e-4) is deliberately conservative to limit this erosion;
+    masking the prio/preempt outputs from the loss is the proper
+    long-term fix and is tracked for v2.
+
+    Raises TraceFormatError if `action_core` is outside [0,
+    MAX_ACTION_CORE) — defends against corrupted trace data leaking
+    an out-of-range action index into the downstream Parquet.
     """
+    if action_core < 0 or action_core >= MAX_ACTION_CORE:
+        raise TraceFormatError(
+            f"action_core={action_core} out of range "
+            f"[0, {MAX_ACTION_CORE}); trace data is likely corrupted"
+        )
     priority_adj = 1  # 'keep'
     preempt = 0
     return (action_core * 3 + priority_adj) * 2 + preempt
@@ -279,10 +306,18 @@ def _build_reward_for_decisions(
     """Compute a reward per DECISION record, by `task_id`.
 
     Strategy:
-    - If a matching COMPLETION exists and the task had a deadline,
-      reward = +1.0 if `deadline_met`, else -1.0.
-    - Otherwise reward = +0.1 (small positive — we observed the
-      decision was made and the system kept running).
+    - Matching COMPLETION + deadline + met:    reward = +1.0
+    - Matching COMPLETION + deadline + missed: reward = -1.0
+    - Matching COMPLETION + no deadline:       reward = +0.1
+        (legitimately positive — task finished successfully)
+    - No matching COMPLETION (still in-flight at dump time, or
+      task slot reused): reward = 0.0
+        (unknown outcome — sample weight is |reward| so these
+        rows contribute nothing to gradient, equivalent to dropping
+        without changing row counts. Prior +0.1 default conflated
+        "no deadline" and "no completion" and added survivor-bias
+        positive signal for tasks that may have been about to miss
+        their deadlines.)
     - Aggregates COMPLETIONs by `task_id`. If multiple COMPLETIONs
       collide on the same id (task slot reuse) we keep the last one;
       the trace ring is short-lived enough that this is rare.
@@ -294,7 +329,11 @@ def _build_reward_for_decisions(
     rewards: dict[int, float] = {}
     for d in parsed.decisions:
         c = by_task.get(d.task_id)
-        if c is None or c.deadline_ns == 0:
+        if c is None:
+            # No completion observed — outcome unknown, neutral reward.
+            rewards[d.task_id] = 0.0
+        elif c.deadline_ns == 0:
+            # Completion observed, no deadline — task finished.
             rewards[d.task_id] = 0.1
         else:
             rewards[d.task_id] = 1.0 if c.deadline_met else -1.0
@@ -305,7 +344,7 @@ def write_parquet(
     parsed: ParsedTrace,
     out_path: Path | str,
     *,
-    platform: str = "raspi5",
+    platform: str = "raspberry_pi5",
     expert_label: str = SLMOS_TRACE_EXPERT_LABEL,
 ) -> int:
     """Serialize the trace's DECISION records into a Parquet file with
@@ -373,7 +412,7 @@ def ingest_path(
     trace_path: Path | str,
     parquet_path: Path | str,
     *,
-    platform: str = "raspi5",
+    platform: str = "raspberry_pi5",
 ) -> int:
     """End-to-end convenience: read a .bin trace, parse it, and emit
     a Parquet file. Returns row count written."""
@@ -391,8 +430,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", required=True, help="path to write the .parquet")
     parser.add_argument(
         "--platform",
-        default="raspi5",
-        help="platform label written to the `platform` column",
+        default="raspberry_pi5",
+        help="platform label written to the `platform` column. Must "
+             "match a key in `slm_sim.platforms.PLATFORMS` (currently "
+             "'raspberry_pi5', 'jetson_orin_nano', or 'big_little') so "
+             "the downstream trainer's `--platform` filter sees the "
+             "rows.",
     )
     parser.add_argument(
         "--quiet", action="store_true", help="suppress summary output"
@@ -409,10 +452,19 @@ def main(argv: list[str] | None = None) -> int:
             f"slmos-trace ingester: {trace_path} → {parquet_path}\n"
             f"  decisions:   {len(parsed.decisions)}\n"
             f"  completions: {len(parsed.completions)}\n"
+            f"  unknown:     {parsed.unknown_records}\n"
             f"  dropped:     {parsed.header.dropped_events}\n"
             f"  rows out:    {n}\n"
             f"  platform:    {args.platform}\n"
         )
+        if parsed.unknown_records > 0:
+            print(
+                f"warning: {parsed.unknown_records} record(s) had an "
+                f"unknown `kind` byte and were skipped. The SLM-OS "
+                f"format may have added a variant; check whether "
+                f"SCHED_TRACE_AI_VERSION needs to move.",
+                file=sys.stderr,
+            )
     return 0
 
 

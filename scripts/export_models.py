@@ -1011,8 +1011,12 @@ def export_mlp(
 
     if checkpoint is not None:
         if not checkpoint.exists():
-            print(f"  SKIP: --weights-checkpoint {checkpoint} does not exist")
-            return
+            # Explicit-checkpoint mismatches mean the operator made a
+            # typo or pointed at a stale path — exit non-zero rather
+            # than silently produce nothing. The baseline-lookup branch
+            # below uses SKIP because "no model trained yet" is a
+            # legitimate state during incremental development.
+            sys.exit(f"export-mlp: --weights-checkpoint {checkpoint} does not exist")
         model_path = checkpoint
     else:
         # Prefer platform-specific model, fall back to generic
@@ -1069,10 +1073,17 @@ def export_ppo(
     file_suffix: str = "",
 ) -> None:
     """Export PPO actor network."""
-    model_path = checkpoint or Path("models/ppo/best_model.zip")
-    if not model_path.exists():
-        print(f"  SKIP: {model_path} not found (training may still be running)")
-        return
+    if checkpoint is not None:
+        if not checkpoint.exists():
+            # Same rationale as export_mlp: explicit-checkpoint typo is
+            # a hard error, baseline lookup miss is a soft SKIP.
+            sys.exit(f"export-ppo: --weights-checkpoint {checkpoint} does not exist")
+        model_path = checkpoint
+    else:
+        model_path = Path("models/ppo/best_model.zip")
+        if not model_path.exists():
+            print(f"  SKIP: {model_path} not found (training may still be running)")
+            return
 
     layers = extract_ppo_actor_layers(model_path)
     max_diff = verify_ppo_actor(model_path, layers)

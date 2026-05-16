@@ -110,6 +110,21 @@ print(f"[{ts()}] Save to: {save_path}", flush=True)
 
 # --- Dataset selection -------------------------------------------------
 
+class _SchedulerSubset(torch.utils.data.Subset):
+    """torch.utils.data.Subset doesn't expose `n_features` /
+    `n_actions` — attributes `train_mlp` reads off the dataset for
+    model construction. This wrapper forwards them from the parent
+    SchedulerDataset so a `random_split` slice still type-checks at
+    the trainer's call sites."""
+    @property
+    def n_features(self):
+        return self.dataset.n_features
+
+    @property
+    def n_actions(self):
+        return self.dataset.n_actions
+
+
 if args.source == "slmos-traces":
     if args.input is None:
         sys.exit("--source slmos-traces requires --input <trace.parquet>")
@@ -119,42 +134,30 @@ if args.source == "slmos-traces":
     t0 = time.time()
     # The ingester labels every row with SLMOS_TRACE_EXPERT_LABEL; the
     # dataset's default expert filter would discard them, so we override.
-    train_ds = SchedulerDataset(
+    full_ds = SchedulerDataset(
         args.input,
         experts={SLMOS_TRACE_EXPERT_LABEL},
         platform=args.platform,
         max_rows=MAX_ROWS,
     )
-    if len(train_ds) == 0:
+    if len(full_ds) == 0:
         sys.exit(
             f"slmos-traces Parquet at {args.input} contains zero rows for "
             f"expert_policy={SLMOS_TRACE_EXPERT_LABEL!r}, "
             f"platform={args.platform!r}. Check the ingester output."
         )
-    # For fine-tuning we use a small held-out split from the same
-    # trace file rather than the simulator's val.parquet — the
-    # distributions differ enough that simulator-val accuracy would
-    # be misleading. 10% val split is plenty for a sanity check at
-    # this data scale.
-    val_size = max(1, len(train_ds) // 10)
-    train_size = len(train_ds) - val_size
-    # SchedulerDataset doesn't expose a slicing API, so re-load the
-    # same file twice with different `max_rows` after a deterministic
-    # shuffle. Cheaper than refactoring the dataset class.
-    train_ds = SchedulerDataset(
-        args.input,
-        experts={SLMOS_TRACE_EXPERT_LABEL},
-        platform=args.platform,
-        max_rows=train_size,
-        seed=42,
+    # Disjoint train/val split via random_split. Earlier two-load-with-
+    # different-seed approach produced overlapping subsamples (both
+    # drew from the same parent set), so val_loss was a noisy mirror
+    # of train_loss rather than a generalization signal.
+    val_size = max(1, len(full_ds) // 10)
+    train_size = len(full_ds) - val_size
+    rng = torch.Generator().manual_seed(42)
+    raw_train, raw_val = torch.utils.data.random_split(
+        full_ds, [train_size, val_size], generator=rng,
     )
-    val_ds = SchedulerDataset(
-        args.input,
-        experts={SLMOS_TRACE_EXPERT_LABEL},
-        platform=args.platform,
-        max_rows=val_size,
-        seed=43,  # different seed so train/val don't overlap exactly
-    )
+    train_ds = _SchedulerSubset(full_ds, raw_train.indices)
+    val_ds = _SchedulerSubset(full_ds, raw_val.indices)
     print(f"[{ts()}] Trace load: {len(train_ds)} train / {len(val_ds)} val "
           f"rows ({time.time() - t0:.1f}s)", flush=True)
     # Fine-tune hyperparameters: smaller LR (preserve pretrained

@@ -141,26 +141,30 @@ so training from scratch on them would overfit. The pretrained
 synthetic baseline already generalizes; the fine-tune nudges it.
 
 ```sh
-# 1. Ingest the binary trace into Parquet
+# 1. Ingest the binary trace into Parquet. The `--platform` label
+#    must match a key in `slm_sim.platforms.PLATFORMS` so the
+#    trainer's downstream `--platform` filter accepts the rows —
+#    if a Pi 5 capture is being ingested, both invocations use
+#    `raspberry_pi5`.
 python data/slmos_traces.py \
     --input /path/to/sched_trace.bin \
     --output data/slmos_traces.parquet \
-    --platform raspi5
+    --platform raspberry_pi5
 
 # 2. Fine-tune the MLP from the existing synthetic checkpoint
 python scripts/_train_mlp.py \
     --source slmos-traces \
     --input data/slmos_traces.parquet \
-    --platform jetson_orin_nano
-# → models/mlp/best_jetson_orin_nano_real.pt
+    --platform raspberry_pi5
+# → models/mlp/best_raspberry_pi5_real.pt
 
 # 3. Export the fine-tuned weights as a `_real` C source alongside
 #    the synthetic-trained ai_weights_mlp.c. SLM-OS's
 #    AI_WEIGHTS=synthetic|real build flag (issue #884) picks one.
 python scripts/export_models.py \
     --model mlp \
-    --platform jetson_orin_nano \
-    --weights-checkpoint models/mlp/best_jetson_orin_nano_real.pt \
+    --platform raspberry_pi5 \
+    --weights-checkpoint models/mlp/best_raspberry_pi5_real.pt \
     --weights-suffix _real
 # → deploy/generated/ai_weights_mlp_real.c
 ```

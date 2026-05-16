@@ -197,7 +197,7 @@ def test_write_parquet_schema_matches_dataset(tmp_path: Path):
     parsed = parse_trace(blob)
 
     out = tmp_path / "trace.parquet"
-    n = write_parquet(parsed, out, platform="raspi5")
+    n = write_parquet(parsed, out, platform="raspberry_pi5")
     assert n == 1
 
     table = pq.read_table(out)
@@ -216,12 +216,15 @@ def test_write_parquet_schema_matches_dataset(tmp_path: Path):
     assert row["action"] == encode_action_index(2)
     assert row["reward"] == pytest.approx(-1.0)
     assert row["expert_policy"] == SLMOS_TRACE_EXPERT_LABEL
-    assert row["platform"] == "raspi5"
+    assert row["platform"] == "raspberry_pi5"
 
 
 def test_write_parquet_default_reward_for_unmatched_decision(tmp_path: Path):
-    """A DECISION without a matching COMPLETION gets reward=+0.1
-    (we observed the decision; no outcome info)."""
+    """A DECISION without a matching COMPLETION gets reward=0.0
+    (unknown outcome — neutral, gradient-free via |reward| sample
+    weight). Earlier +0.1 default was a survivor-bias kludge: it
+    pushed in-flight tasks that may have been about to miss their
+    deadlines into the positive-reward bucket."""
     state = np.ones(SCHED_TRACE_AI_STATE_DIM, dtype=np.float32)
     blob = _build_header(record_count=1) + _build_decision(
         cpu=0, task_id=99, timestamp_ns=10, policy="ai_xgb",
@@ -231,13 +234,41 @@ def test_write_parquet_default_reward_for_unmatched_decision(tmp_path: Path):
     out = tmp_path / "trace.parquet"
     write_parquet(parsed, out)
     row = pq.read_table(out).to_pylist()[0]
+    assert row["reward"] == pytest.approx(0.0)
+
+
+def test_write_parquet_reward_for_completion_without_deadline(tmp_path: Path):
+    """A DECISION + matching COMPLETION but with deadline_ns=0 gets
+    reward=+0.1 (legitimately positive — task observably finished,
+    just no deadline pressure to grade against). This is the case
+    the old +0.1 default was originally for; the survivor-bias fix
+    keeps this branch but drops the "no completion observed" case
+    to 0.0."""
+    state = np.zeros(SCHED_TRACE_AI_STATE_DIM, dtype=np.float32)
+    blob = (
+        _build_header(record_count=2)
+        + _build_decision(
+            cpu=0, task_id=11, timestamp_ns=10, policy="heuristic",
+            core=0, priority=4, preempt=0, state=state,
+        )
+        + _build_completion(
+            cpu=0, task_id=11, timestamp_ns=20,
+            dispatch_ns=10, completion_ns=20, deadline_ns=0,  # no deadline
+            latency_us=10, ran_on_cpu=0, deadline_met=1,
+        )
+    )
+    parsed = parse_trace(blob)
+    out = tmp_path / "trace.parquet"
+    write_parquet(parsed, out)
+    row = pq.read_table(out).to_pylist()[0]
     assert row["reward"] == pytest.approx(0.1)
 
 
-def test_unknown_kind_skipped(tmp_path: Path):
-    """Records with kind > 2 are silently skipped so a future SLM-OS
-    format extension (adding kind=3 = MIGRATION, say) doesn't break
-    older ingesters."""
+def test_unknown_kind_skipped_and_counted(tmp_path: Path):
+    """Records with kind > 2 are skipped (so a future SLM-OS format
+    extension like kind=3=MIGRATION doesn't break older ingesters),
+    but the count surfaces in ParsedTrace.unknown_records so main()
+    can warn the operator instead of silently dropping rows."""
     state = np.zeros(SCHED_TRACE_AI_STATE_DIM, dtype=np.float32)
     unknown = bytearray(SCHED_TRACE_AI_RECORD_SIZE)
     unknown[0] = 99  # not 1 or 2
@@ -249,6 +280,24 @@ def test_unknown_kind_skipped(tmp_path: Path):
     parsed = parse_trace(blob)
     assert len(parsed.decisions) == 1
     assert len(parsed.completions) == 0
+    assert parsed.unknown_records == 1
+
+
+def test_encode_action_index_rejects_out_of_range():
+    """encode_action_index hard-fails on corrupted action_core values
+    rather than silently propagating them into the Parquet's action
+    column where the downstream trainer's n_actions check would
+    eventually surface a less useful error."""
+    from data.slmos_traces import MAX_ACTION_CORE
+    with pytest.raises(TraceFormatError, match="out of range"):
+        encode_action_index(-1)
+    with pytest.raises(TraceFormatError, match="out of range"):
+        encode_action_index(MAX_ACTION_CORE)
+    with pytest.raises(TraceFormatError, match="out of range"):
+        encode_action_index(99)
+    # In-range boundary: 0 and MAX_ACTION_CORE-1 must succeed.
+    encode_action_index(0)
+    encode_action_index(MAX_ACTION_CORE - 1)
 
 
 def test_format_constants_pin():
