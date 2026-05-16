@@ -245,7 +245,13 @@ def _xgb_parse_base_score(bs_raw) -> list:
         return [float(bs_raw)]
     if isinstance(parsed, list):
         return [float(x) for x in parsed]
-    return [float(parsed)]
+    if isinstance(parsed, (int, float)):
+        return [float(parsed)]
+    # JSON parsed to something exotic (dict, None, bool, ...) — not a
+    # numeric. Fall back to `float()` on the raw string; if that also
+    # fails the caller sees a more informative ValueError from
+    # `float()` than a TypeError from `float(<dict>)`.
+    return [float(bs_raw)]
 
 
 def export_xgboost_trees(model_dir: Path) -> dict:

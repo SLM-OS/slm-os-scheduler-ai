@@ -639,6 +639,9 @@ class TestXGBoostBaseScoreFold:
         export."""
         from scripts.export_models import _xgb_logit
         out = _xgb_logit(0.0)
+        # Bounds derived from the eps=1e-12 clamp inside `_xgb_logit`:
+        # log(1e-12 / (1 - 1e-12)) ≈ -27.63. If eps changes, the test
+        # bounds need to track it.
         assert out < -25.0 and out > -28.0, (
             f"logit(0) should clamp to a large-negative finite value, got {out}"
         )
@@ -710,12 +713,16 @@ class TestXGBoostBaseScoreFold:
         from scripts.export_models import export_xgboost_trees
 
         rng = _np.random.default_rng(7)
-        # Binary classifier — heavily imbalanced so base_score lands
-        # well away from 0.5 (mirroring preempt's pathology).
+        # Binary classifier — pin `base_score` explicitly so the test
+        # doesn't depend on XGBoost's auto-derivation logic (which is
+        # version-sensitive). 0.03 mirrors preempt's pathological
+        # imbalance, giving a strongly negative class-1 logit.
+        pinned_base = 0.03
         X_bin = rng.random((400, 6), dtype=_np.float32)
         y_bin = (rng.random(400) > 0.97).astype(_np.int32)
         bin_clf = xgb_mod.XGBClassifier(
             n_estimators=4, max_depth=2, random_state=0,
+            base_score=pinned_base,
         ).fit(X_bin, y_bin)
 
         # Multiclass — three balanced classes.
@@ -756,11 +763,17 @@ class TestXGBoostBaseScoreFold:
         assert len(first) == 1 and first[0]["feature_idx"] == -1
         assert first[0]["leaf_value"] == 0.0
         assert len(second) == 1 and second[0]["feature_idx"] == -1
-        # XGBoost may store base_score auto-derived from the data;
-        # for this skewed binary fit it's well below 0.5, so the
-        # class-1 logit must be strongly negative.
-        assert second[0]["leaf_value"] < -1.0, (
-            "expected logit(base_score) < -1 for the imbalanced binary fit"
+        # Class-1 leaf must equal logit(pinned_base) within float
+        # tolerance. logit(0.03) ≈ -3.476 — well outside what a
+        # default base_score=0.5 (logit=0) or rounding noise could
+        # produce, so a regression in the fold (e.g. forgetting the
+        # logit transform, or fetching the wrong booster field) makes
+        # this assertion fail loudly with a specific delta rather
+        # than a vague threshold miss.
+        expected_logit = _math.log(pinned_base / (1.0 - pinned_base))
+        assert abs(second[0]["leaf_value"] - expected_logit) < 1e-4, (
+            f"expected leaf ≈ logit({pinned_base}) = {expected_logit:.6f}, "
+            f"got {second[0]['leaf_value']}"
         )
 
         # Multiclass slot: 3 synthetic trees prepended, each carrying
