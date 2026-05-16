@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from training.mlp.dataset import SchedulerDataset
 from training.mlp.train import train_mlp, TrainConfig
+from training.mlp._subset import SchedulerSubset
 
 import torch
 
@@ -110,21 +111,6 @@ print(f"[{ts()}] Save to: {save_path}", flush=True)
 
 # --- Dataset selection -------------------------------------------------
 
-class _SchedulerSubset(torch.utils.data.Subset):
-    """torch.utils.data.Subset doesn't expose `n_features` /
-    `n_actions` — attributes `train_mlp` reads off the dataset for
-    model construction. This wrapper forwards them from the parent
-    SchedulerDataset so a `random_split` slice still type-checks at
-    the trainer's call sites."""
-    @property
-    def n_features(self):
-        return self.dataset.n_features
-
-    @property
-    def n_actions(self):
-        return self.dataset.n_actions
-
-
 if args.source == "slmos-traces":
     if args.input is None:
         sys.exit("--source slmos-traces requires --input <trace.parquet>")
@@ -140,11 +126,18 @@ if args.source == "slmos-traces":
         platform=args.platform,
         max_rows=MAX_ROWS,
     )
-    if len(full_ds) == 0:
+    if len(full_ds) < 2:
+        # Need at least 2 rows so the train/val split below yields a
+        # non-empty train set; len==1 would give val_size=1, train_size=0
+        # and the trainer would crash inside its dataloader on the
+        # empty train slice. A real SLM-OS capture has hundreds to
+        # thousands of decisions — this guard is defensive against a
+        # broken or truncated trace, not an expected case.
         sys.exit(
-            f"slmos-traces Parquet at {args.input} contains zero rows for "
-            f"expert_policy={SLMOS_TRACE_EXPERT_LABEL!r}, "
-            f"platform={args.platform!r}. Check the ingester output."
+            f"slmos-traces Parquet at {args.input} has only {len(full_ds)} "
+            f"usable row(s) for expert_policy={SLMOS_TRACE_EXPERT_LABEL!r}, "
+            f"platform={args.platform!r}. Need at least 2 for a meaningful "
+            f"train/val split. Check the ingester output."
         )
     # Disjoint train/val split via random_split. Earlier two-load-with-
     # different-seed approach produced overlapping subsamples (both
@@ -156,8 +149,8 @@ if args.source == "slmos-traces":
     raw_train, raw_val = torch.utils.data.random_split(
         full_ds, [train_size, val_size], generator=rng,
     )
-    train_ds = _SchedulerSubset(full_ds, raw_train.indices)
-    val_ds = _SchedulerSubset(full_ds, raw_val.indices)
+    train_ds = SchedulerSubset(full_ds, raw_train.indices)
+    val_ds = SchedulerSubset(full_ds, raw_val.indices)
     print(f"[{ts()}] Trace load: {len(train_ds)} train / {len(val_ds)} val "
           f"rows ({time.time() - t0:.1f}s)", flush=True)
     # Fine-tune hyperparameters: smaller LR (preserve pretrained

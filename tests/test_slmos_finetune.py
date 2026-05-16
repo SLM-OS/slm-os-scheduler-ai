@@ -23,8 +23,6 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 import torch
 
@@ -108,6 +106,35 @@ def _make_tiny_pretrained_checkpoint(out_path: Path, n_actions: int) -> None:
         hidden1=256, hidden2=256, hidden3=128, dropout=0.1,
     )
     torch.save(model.state_dict(), out_path)
+
+
+def test_scheduler_subset_forwards_attributes(tmp_path: Path):
+    """SchedulerSubset must forward n_features and n_actions from the
+    parent SchedulerDataset so train_mlp's call sites can read them
+    off a slice. The end-to-end @slow test exercises this transitively,
+    but a direct unit test pins the contract regardless of @slow runs."""
+    from training.mlp.dataset import SchedulerDataset
+    from training.mlp._subset import SchedulerSubset
+
+    parquet = tmp_path / "trace.parquet"
+    _build_minimal_trace_parquet(parquet, n_rows=8)
+    full_ds = SchedulerDataset(
+        parquet,
+        experts={SLMOS_TRACE_EXPERT_LABEL},
+        platform="raspberry_pi5",
+        max_rows=100,
+    )
+
+    sub = SchedulerSubset(full_ds, indices=[0, 1, 2])
+    assert sub.n_features == full_ds.n_features
+    assert sub.n_actions == full_ds.n_actions
+    assert len(sub) == 3
+
+    # Empty slice still type-checks (degenerate but legal).
+    empty = SchedulerSubset(full_ds, indices=[])
+    assert empty.n_features == full_ds.n_features
+    assert empty.n_actions == full_ds.n_actions
+    assert len(empty) == 0
 
 
 def test_random_split_produces_disjoint_train_val(tmp_path: Path):
