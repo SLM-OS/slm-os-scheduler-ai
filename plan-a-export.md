@@ -66,9 +66,42 @@ python scripts/export_models.py --model mlp|ppo|xgboost|all \
 
 **Validation:** Script checks that model output dimension matches target platform's action space. Refuses to export if mismatched and prints retrain instructions.
 
-## ~~Step 4: XGBoost Export~~ — DROPPED
+## Step 4: XGBoost Export — runtime-binary form (re-enabled, #58a / #850)
 
-XGBoost export produced 24 MB of tree node data (462K nodes across 1,400 trees) — far too large for bare-metal kernel deployment. Evaluation also showed XGBoost (97.0% DCR) underperforming MLP (99.3%). Dropping XGBoost from kernel integration; focusing on MLP + PPO.
+The original drop rationale was twofold: (1) the C-source form ballooned the
+kernel image by ~24 MB, and (2) XGBoost's 97.0% DCR underperforms MLP's 99.3%.
+SLM-OS reframed both: per #848 (pluggable-policy framing), policies are
+options that expand the comparison space, not winners chasing a leaderboard;
+and per #58 the cascade is *runtime-loaded* via the existing scheduler blob
+subsystem, so it never enters the kernel image.
+
+**Output:** `deploy/generated/xgb_sched.smb` — single SEMB-wrapped binary
+holding all three classifiers (`core / priority / preempt`) in cascade form.
+Walk it via `slm.sched_model_stage("xgboost", path)` →
+`slm.sched_model_activate("xgboost")` → `slm.sched_set_policy("ai_xgb")`.
+
+**Wire format** (kept in sync with `runtime/src/ml/xgb_tree.rs` in the
+SLM-OS repo):
+
+- 24-byte SEMB outer header (magic `SEMB`, version 1, kind `SCHED_MODEL_KIND_XGBOOST` = 0x1006, schema 1, payload length, FNV-1a checksum).
+- 16-byte XGBC payload header (magic `XGBC`, version 1, classifier count).
+- Per classifier: 16-byte section header (`u32 n_trees`, `u32 n_nodes`, `u16 n_classes`, padding) + `u32` root-offset table + 20-byte node records (`u16 feature_idx, u16 flags, u32 left, u32 right, f32 threshold, f32 value`) + `i32` label-class map.
+
+The 20-byte cascade node format and `u32` indices are required: the trained
+`core_clf` flattens to ~450 K nodes — well past the eviction-side u16
+ceiling.
+
+**Verification artifacts** (mirror MLP/PPO):
+- `test_vectors_xgb.bin` — 1000 raw 108-float state vectors. SLM-OS computes
+  the 5 derived features in-kernel and self-checks the derivation logic.
+- `expected_actions_xgb.bin` — 1000 ground-truth `(core, priority, preempt)`
+  triples from `TripleClassifier.predict` in Python.
+- `expected_logits_xgb.bin` — per-classifier `predict_proba` for the first
+  10 vectors. Debugging aid; not required for the bit-equality test.
+
+**CLI:** `python scripts/export_models.py --model xgboost --platform <p>`.
+The legacy C-source form is retained behind `--xgb-emit-c-source` for local
+inspection only and is never shipped.
 
 ## Step 5: Verification Artifacts
 
