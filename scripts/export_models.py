@@ -436,7 +436,8 @@ def _xgb_pack_node(node: dict) -> bytes:
     )
 
 
-# Cascade per-classifier limits — must mirror runtime/src/ml/xgb_tree.rs.
+# Cascade limits — must mirror runtime/src/ml/xgb_tree.rs.
+_XGB_MAX_CLASSIFIERS = 8
 _XGB_MAX_TREES_CASCADE = 16_384
 _XGB_MAX_NODES_CASCADE = 2_000_000
 _XGB_MAX_LABEL_CLASSES = 64
@@ -510,8 +511,11 @@ def _build_xgbc_payload(trees_data: dict, classifier_order: list[str]) -> bytes:
     n = len(classifier_order)
     if n == 0:
         raise ValueError("cascade has zero classifiers")
-    if n > 8:
-        raise ValueError(f"cascade has {n} classifiers — exceeds 8")
+    if n > _XGB_MAX_CLASSIFIERS:
+        raise ValueError(
+            f"cascade has {n} classifiers — exceeds runtime cap "
+            f"{_XGB_MAX_CLASSIFIERS} (raise MAX_CLASSIFIERS in xgb_tree.rs)"
+        )
     header = struct.pack(
         "<4sHHHHI",
         _XGBC_MAGIC,
@@ -538,21 +542,30 @@ def _wrap_semb(payload: bytes, kind_id: int, schema_version: int) -> bytes:
         raise ValueError(f"schema_version {schema_version} out of u16 range")
     payload_len = len(payload)
     checksum = _fnv1a_32(payload)
+    # SEMB header layout (24 bytes total — must match
+    # `runtime/src/mm/eviction/blob.rs::HEADER_LEN`):
+    #   off  0..4   "SEMB" magic
+    #   off  4..6   u16  version
+    #   off  6..8   u16  kind_id
+    #   off  8..10  u16  schema_version
+    #   off 10..12  u16  reserved (must be 0)
+    #   off 12..16  u32  payload_len
+    #   off 16..20  u32  checksum (FNV-1a 32 over payload)
+    #   off 20..24  u32  reserved (must be 0)
+    # `<4sHHHHII` packs the first 20 bytes; the trailing reserved
+    # u32 is appended separately so the layout is greppable against
+    # the field comments above.
     header = struct.pack(
         "<4sHHHHII",
         _SEMB_MAGIC,
         _SEMB_VERSION_V1,
         kind_id,
         schema_version,
-        0,                  # reserved
+        0,                  # reserved (offset 10..12)
         payload_len,
         checksum,
     )
-    # Trailing reserved u32 (offset 20..24). struct.pack with `<4sHHHHII`
-    # produces 24 bytes total because Python's `I` is 4 bytes — so the
-    # second `I` is the reserved slot, but its value is the checksum
-    # above. Append the trailing reserved word explicitly.
-    header += struct.pack("<I", 0)
+    header += struct.pack("<I", 0)  # reserved (offset 20..24)
     return header + payload
 
 

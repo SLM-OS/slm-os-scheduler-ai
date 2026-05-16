@@ -464,6 +464,112 @@ class TestXGBoostBinaryBlob:
         labels = [_walk_classifier(c, features) for c in parsed["classifiers"]]
         assert labels == [7, 200, 1]
 
+    def test_blob_roundtrips_interior_node_tree(self):
+        """Round-trip a classifier whose tree has an interior node so
+        the test exercises the threshold + child-rebasing code paths
+        in `_xgb_pack_node` and `_build_classifier_section` (the
+        leaf-only test above leaves these untouched). Verifies
+        split-then-leaf decisions match a direct tree walk on the
+        source dict."""
+        from scripts.export_models import (
+            _build_xgbc_payload, _wrap_semb,
+            SCHED_MODEL_KIND_XGBOOST, SCHED_MODEL_SCHEMA_V1,
+            XGB_CASCADE_ORDER,
+        )
+
+        # One tree per class. Class 0's tree splits on feature 0 at
+        # threshold 0.5: < goes left (-1.0), >= goes right (+1.0).
+        # Class 1's tree is a constant leaf 0.0. So:
+        #   features[0] < 0.5  → class 0 score -1.0, class 1 score 0.0 → argmax = 1
+        #   features[0] >= 0.5 → class 0 score +1.0, class 1 score 0.0 → argmax = 0
+        def make_split_clf(labels):
+            return {
+                "trees": [
+                    [   # tree for class 0 — interior split + two leaves
+                        {
+                            "feature_idx": 0,
+                            "threshold": 0.5,
+                            "leaf_value": 0.0,
+                            "left_child": 1,
+                            "right_child": 2,
+                        },
+                        {
+                            "feature_idx": -1,
+                            "threshold": 0.0,
+                            "leaf_value": -1.0,
+                            "left_child": 0,
+                            "right_child": 0,
+                        },
+                        {
+                            "feature_idx": -1,
+                            "threshold": 0.0,
+                            "leaf_value": 1.0,
+                            "left_child": 0,
+                            "right_child": 0,
+                        },
+                    ],
+                    [   # tree for class 1 — single leaf
+                        {
+                            "feature_idx": -1,
+                            "threshold": 0.0,
+                            "leaf_value": 0.0,
+                            "left_child": 0,
+                            "right_child": 0,
+                        },
+                    ],
+                ],
+                "n_classes": 2,
+                "label_classes": labels,
+            }
+
+        # All three classifiers in the cascade use the same shape so
+        # the per-classifier section header + child rebasing get
+        # exercised three times back-to-back (different starting
+        # offsets in the flat node array catches the rebase math).
+        trees_data = {
+            "core": make_split_clf([10, 20]),
+            "priority": make_split_clf([30, 40]),
+            "preempt": make_split_clf([50, 60]),
+        }
+        payload = _build_xgbc_payload(trees_data, XGB_CASCADE_ORDER)
+        blob = _wrap_semb(
+            payload,
+            kind_id=SCHED_MODEL_KIND_XGBOOST,
+            schema_version=SCHED_MODEL_SCHEMA_V1,
+        )
+        parsed = _parse_smb_blob(blob)
+        assert len(parsed["classifiers"]) == 3
+        # Each classifier's first tree has 3 nodes (1 interior + 2
+        # leaves), second tree has 1 leaf — 4 nodes total per
+        # classifier. After flattening + rebasing, the split tree's
+        # root sits at offset 0 with children at offsets 1, 2; the
+        # second tree's leaf sits at offset 3 (root_offsets[1] = 3).
+        for clf in parsed["classifiers"]:
+            assert clf["n_nodes"] == 4
+            assert clf["roots"] == [0, 3]
+            # Interior node points at the right children post-rebase.
+            assert clf["nodes"][0]["flags"] == 0
+            assert clf["nodes"][0]["left"] == 1
+            assert clf["nodes"][0]["right"] == 2
+            assert clf["nodes"][0]["threshold"] == 0.5
+            # Leaves carry the FLAG_LEAF bit and their values.
+            assert clf["nodes"][1]["flags"] & 1
+            assert clf["nodes"][1]["value"] == -1.0
+            assert clf["nodes"][2]["flags"] & 1
+            assert clf["nodes"][2]["value"] == 1.0
+
+        # Walk the parsed cascade and verify the decisions match the
+        # split semantics — confirms `_xgb_pack_node` interior-node
+        # encoding round-trips correctly through `_walk_tree`.
+        labels_low = [_walk_classifier(c, [0.0]) for c in parsed["classifiers"]]
+        labels_high = [_walk_classifier(c, [1.0]) for c in parsed["classifiers"]]
+        # features[0]=0.0 < 0.5 → class 0 score -1.0, class 1 score 0.0
+        # → argmax = 1 → label_classes[1] of (10,20),(30,40),(50,60).
+        assert labels_low == [20, 40, 60]
+        # features[0]=1.0 >= 0.5 → class 0 score +1.0, class 1 score 0.0
+        # → argmax = 0 → label_classes[0].
+        assert labels_high == [10, 30, 50]
+
     def test_blob_format_constants_match_runtime(self):
         """The SEMB outer-header version + XGBC inner magic + node size
         are wire-format constants that must stay synchronized with the
