@@ -353,6 +353,344 @@ def _write_float_array(lines: list[str], arr: np.ndarray, cols: int = 4) -> None
         lines.append(f"    {formatted}{suffix}")
 
 
+# ---------------------------------------------------------------------------
+# XGBoost binary blob exporter (SLM-OS scheduler runtime-load format)
+# ---------------------------------------------------------------------------
+
+# Outer header constants — must match runtime/src/mm/eviction/blob.rs in the
+# SLM-OS repo. Layout is shared between the eviction store (kind 1..3) and
+# the scheduler model store (kind 0x1001..0x1006). The scheduler XGBoost
+# kind id is 0x1006 (SCHED_MODEL_KIND_XGBOOST), introduced in #58c.
+_SEMB_MAGIC = b"SEMB"
+_SEMB_VERSION_V1 = 1
+_SEMB_OUTER_HEADER_LEN = 24
+
+# Sched-side blob-kind ids. Coordinated with kernel/sched/ai/runtime_model.h.
+SCHED_MODEL_KIND_XGBOOST = 0x1006
+SCHED_MODEL_SCHEMA_V1 = 1
+
+# Inner cascade payload — must match runtime/src/ml/xgb_tree.rs (XgbCascade).
+_XGBC_MAGIC = b"XGBC"
+_XGB_PAYLOAD_VERSION_V1 = 1
+_XGBC_HEADER_LEN = 16
+# Per-classifier header: u32 n_trees, u32 n_nodes, u16 n_classes, u16 r,
+# u32 reserved.
+_XGBC_CLASSIFIER_HEADER_LEN = 16
+# Per-node record layout (cascade form, u32 children — must match
+# `runtime/src/ml/xgb_tree.rs::CASCADE_NODE_LEN_V1`). All fields LE.
+#   u16 feature_idx, u16 flags, u32 left, u32 right, f32 threshold, f32 value
+_XGB_NODE_LEN = 20
+_XGB_FLAG_LEAF = 1
+
+
+def _fnv1a_32(data: bytes) -> int:
+    """FNV-1a 32-bit checksum. Mirrors blob.rs::checksum32."""
+    h = 0x811C9DC5
+    for b in data:
+        h ^= b
+        h = (h * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+def _xgb_pack_node(node: dict) -> bytes:
+    """Pack a flattened XGBoost node into the 20-byte cascade record.
+
+    `_flatten_tree` emits dicts with `feature_idx, threshold, leaf_value,
+    left_child, right_child`. Leaves are tagged with `feature_idx == -1`
+    by the flattener; here we set the FLAG_LEAF bit and store the leaf
+    value in the `value` field. Interior nodes carry the split feature
+    index + threshold and the left/right child offsets within the
+    classifier's flat node array.
+
+    Children are u32 — required to address the trained `core_clf`
+    (~450 K nodes) which overflows the eviction-side u16 wire format.
+    """
+    is_leaf = node["feature_idx"] < 0
+    if is_leaf:
+        return struct.pack(
+            "<HHIIff",
+            0,                          # feature_idx unused
+            _XGB_FLAG_LEAF,
+            0,                          # left unused
+            0,                          # right unused
+            0.0,                        # threshold unused
+            float(node["leaf_value"]),
+        )
+    feature_idx = int(node["feature_idx"])
+    if feature_idx < 0 or feature_idx > 0xFFFF:
+        raise ValueError(f"feature_idx {feature_idx} out of u16 range")
+    left = int(node["left_child"])
+    right = int(node["right_child"])
+    if max(left, right) > 0xFFFFFFFF:
+        raise ValueError(
+            f"node child index out of u32 range (left={left}, right={right})"
+        )
+    return struct.pack(
+        "<HHIIff",
+        feature_idx,
+        0,
+        left,
+        right,
+        float(node["threshold"]),
+        0.0,
+    )
+
+
+# Cascade limits — must mirror runtime/src/ml/xgb_tree.rs.
+_XGB_MAX_CLASSIFIERS = 8
+_XGB_MAX_TREES_CASCADE = 16_384
+_XGB_MAX_NODES_CASCADE = 2_000_000
+_XGB_MAX_LABEL_CLASSES = 64
+
+
+def _build_classifier_section(clf_data: dict) -> bytes:
+    """Serialize one classifier (header + roots + nodes + label map)."""
+    trees = clf_data["trees"]
+    label_classes = list(clf_data["label_classes"])
+    n_classes = len(label_classes)
+
+    # Flatten trees into one per-classifier node array. `tree_offsets`
+    # gives the index in the flat array where each tree's root sits.
+    tree_offsets: list[int] = []
+    flat_nodes: list[dict] = []
+    for nodes in trees:
+        offset = len(flat_nodes)
+        tree_offsets.append(offset)
+        # Re-base every interior node's child indices into the flat array.
+        for node in nodes:
+            if node["feature_idx"] < 0:
+                flat_nodes.append(node)
+            else:
+                flat_nodes.append({
+                    "feature_idx": node["feature_idx"],
+                    "threshold": node["threshold"],
+                    "leaf_value": 0.0,
+                    "left_child": node["left_child"] + offset,
+                    "right_child": node["right_child"] + offset,
+                })
+
+    n_trees = len(trees)
+    n_nodes = len(flat_nodes)
+    if n_trees == 0 or n_nodes == 0:
+        raise ValueError("classifier has no trees or nodes")
+    if n_trees > _XGB_MAX_TREES_CASCADE:
+        raise ValueError(
+            f"classifier has {n_trees} trees — exceeds runtime cap "
+            f"{_XGB_MAX_TREES_CASCADE} (raise MAX_TREES_CASCADE in xgb_tree.rs)"
+        )
+    if n_nodes > _XGB_MAX_NODES_CASCADE:
+        raise ValueError(
+            f"classifier has {n_nodes} nodes — exceeds runtime cap "
+            f"{_XGB_MAX_NODES_CASCADE} (raise MAX_NODES_CASCADE in xgb_tree.rs)"
+        )
+    if n_classes > _XGB_MAX_LABEL_CLASSES:
+        raise ValueError(
+            f"too many label classes: {n_classes} > {_XGB_MAX_LABEL_CLASSES}"
+        )
+
+    out = bytearray()
+    out += struct.pack(
+        "<IIHHI",
+        n_trees,
+        n_nodes,
+        n_classes,
+        0,                  # reserved (u16)
+        0,                  # reserved (u32)
+    )
+    for off in tree_offsets:
+        out += struct.pack("<I", off)
+    for node in flat_nodes:
+        out += _xgb_pack_node(node)
+    for cls in label_classes:
+        out += struct.pack("<i", int(cls))
+    return bytes(out)
+
+
+def _build_xgbc_payload(trees_data: dict, classifier_order: list[str]) -> bytes:
+    """Build the XGBC cascade payload (header + N classifier sections)."""
+    n = len(classifier_order)
+    if n == 0:
+        raise ValueError("cascade has zero classifiers")
+    if n > _XGB_MAX_CLASSIFIERS:
+        raise ValueError(
+            f"cascade has {n} classifiers — exceeds runtime cap "
+            f"{_XGB_MAX_CLASSIFIERS} (raise MAX_CLASSIFIERS in xgb_tree.rs)"
+        )
+    header = struct.pack(
+        "<4sHHHHI",
+        _XGBC_MAGIC,
+        _XGB_PAYLOAD_VERSION_V1,
+        0,                  # reserved
+        n,
+        0,                  # reserved
+        0,                  # reserved
+    )
+    sections = b"".join(
+        _build_classifier_section(trees_data[name])
+        for name in classifier_order
+    )
+    return header + sections
+
+
+def _wrap_semb(payload: bytes, kind_id: int, schema_version: int) -> bytes:
+    """Wrap an inner payload in the outer SEMB header expected by the
+    scheduler model store (kernel/sched/ai/runtime_model.c).
+    """
+    if not (0 <= kind_id <= 0xFFFF):
+        raise ValueError(f"kind_id {kind_id} out of u16 range")
+    if not (0 <= schema_version <= 0xFFFF):
+        raise ValueError(f"schema_version {schema_version} out of u16 range")
+    payload_len = len(payload)
+    checksum = _fnv1a_32(payload)
+    # SEMB header layout (24 bytes total — must match
+    # `runtime/src/mm/eviction/blob.rs::HEADER_LEN`):
+    #   off  0..4   "SEMB" magic
+    #   off  4..6   u16  version
+    #   off  6..8   u16  kind_id
+    #   off  8..10  u16  schema_version
+    #   off 10..12  u16  reserved (must be 0)
+    #   off 12..16  u32  payload_len
+    #   off 16..20  u32  checksum (FNV-1a 32 over payload)
+    #   off 20..24  u32  reserved (must be 0)
+    # `<4sHHHHII` packs the first 20 bytes; the trailing reserved
+    # u32 is appended separately so the layout is greppable against
+    # the field comments above.
+    header = struct.pack(
+        "<4sHHHHII",
+        _SEMB_MAGIC,
+        _SEMB_VERSION_V1,
+        kind_id,
+        schema_version,
+        0,                  # reserved (offset 10..12)
+        payload_len,
+        checksum,
+    )
+    header += struct.pack("<I", 0)  # reserved (offset 20..24)
+    return header + payload
+
+
+# Cascade ordering must match TripleClassifier.predict in
+# training/xgboost/train.py: core → priority(+core) → preempt(+core+priority).
+# The on-target Rust predictor walks classifiers in this order and appends
+# each prediction to the feature vector before invoking the next.
+XGB_CASCADE_ORDER = ["core", "priority", "preempt"]
+
+
+def write_xgboost_blob(
+    trees_data: dict,
+    output_dir: Path,
+    blob_name: str = "xgb_sched.smb",
+) -> Path:
+    """Write the trained XGBoost cascade as a single binary blob suitable
+    for runtime loading via `slm.sched_model_stage("xgboost", path)`.
+
+    Replaces the rejected Plan A C-source form. Returns the path written.
+    """
+    payload = _build_xgbc_payload(trees_data, XGB_CASCADE_ORDER)
+    blob = _wrap_semb(
+        payload,
+        kind_id=SCHED_MODEL_KIND_XGBOOST,
+        schema_version=SCHED_MODEL_SCHEMA_V1,
+    )
+    out_path = output_dir / blob_name
+    out_path.write_bytes(blob)
+
+    total_trees = sum(len(trees_data[n]["trees"]) for n in XGB_CASCADE_ORDER)
+    total_nodes = sum(
+        sum(len(t) for t in trees_data[n]["trees"])
+        for n in XGB_CASCADE_ORDER
+    )
+    print(
+        f"  XGBoost blob: {len(blob):,} bytes "
+        f"({total_trees} trees, {total_nodes:,} nodes across "
+        f"{len(XGB_CASCADE_ORDER)} classifiers)"
+    )
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# XGBoost verification artifacts
+# ---------------------------------------------------------------------------
+
+def _load_triple_classifier(model_dir: Path):
+    """Load the trained TripleClassifier the cascade was emitted from.
+    Used only to compute expected-action ground truth for verification.
+    """
+    from training.xgboost.train import TripleClassifier
+    return TripleClassifier.load(model_dir)
+
+
+def _add_derived_features_numpy(states: np.ndarray) -> np.ndarray:
+    """Wrapper around training.xgboost.features.add_derived_features that
+    keeps this module's import surface flat. Returns (N, 113)."""
+    from training.xgboost.features import add_derived_features
+    return add_derived_features(states)
+
+
+def generate_xgb_verification_data(
+    model_dir: Path,
+    output_dir: Path,
+    n_tests: int = 1000,
+) -> None:
+    """Generate `test_vectors_xgb.bin` (raw 108-dim states), the matching
+    `expected_actions_xgb.bin` (Python ground-truth `(core, priority,
+    preempt)` triples), and `expected_logits_xgb.bin` (per-classifier
+    raw scores for the first 10 vectors — debugging aid).
+
+    The 108-dim states are written raw so SLM-OS can compute the 5
+    derived features in-kernel and self-check the derivation logic.
+    """
+    triple = _load_triple_classifier(model_dir)
+    rng = np.random.default_rng(54321)
+    states = rng.random((n_tests, TOTAL_FEATURES), dtype=np.float32)
+
+    X = _add_derived_features_numpy(states)
+    core, priority, preempt = triple.predict(X)
+    actions = np.stack(
+        [
+            core.astype(np.int32),
+            priority.astype(np.int32),
+            preempt.astype(np.int32),
+        ],
+        axis=1,
+    )
+
+    states.tofile(output_dir / "test_vectors_xgb.bin")
+    actions.tofile(output_dir / "expected_actions_xgb.bin")
+
+    # Per-classifier raw scores for the first 10 vectors. Each row is
+    # `core_logits || priority_logits || preempt_logits` flattened, so
+    # row stride depends on how many classes each classifier has.
+    debug_logits: list[np.ndarray] = []
+    X10 = X[:10]
+    core_enc = triple.core_clf.predict(X10)
+    core_orig = triple.core_le.inverse_transform(core_enc)
+    X10_c = np.hstack([X10, core_orig.reshape(-1, 1)])
+    prio_enc = triple.priority_clf.predict(X10_c)
+    prio_orig = triple.priority_le.inverse_transform(prio_enc)
+    X10_cp = np.hstack([X10_c, prio_orig.reshape(-1, 1)])
+    debug_logits.append(triple.core_clf.predict_proba(X10).astype(np.float32))
+    debug_logits.append(
+        triple.priority_clf.predict_proba(X10_c).astype(np.float32)
+    )
+    debug_logits.append(
+        triple.preempt_clf.predict_proba(X10_cp).astype(np.float32)
+    )
+    # Concatenate by row: each test vector's row is the per-classifier
+    # probability vectors back-to-back. Use a fixed-width record so
+    # the consuming side can mmap predictably.
+    flat = np.concatenate(
+        [arr.reshape(arr.shape[0], -1) for arr in debug_logits],
+        axis=1,
+    )
+    flat.astype(np.float32).tofile(output_dir / "expected_logits_xgb.bin")
+
+    print(
+        f"  Verification: {n_tests} state vectors + ground-truth actions "
+        f"+ debug logits (first 10)"
+    )
+
+
 def write_xgboost_c(
     trees_data: dict,
     output_dir: Path,
@@ -710,15 +1048,33 @@ def export_ppo(platform_name: str, n_actions: int, output_dir: Path) -> None:
     print(f"  PPO exported: {total_params} params, ~{total_params * 4 / 1024:.0f} KB")
 
 
-def export_xgboost(platform_name: str, n_actions: int, output_dir: Path) -> None:
-    """Export XGBoost classifiers."""
+def export_xgboost(
+    platform_name: str,
+    n_actions: int,
+    output_dir: Path,
+    emit_c_source: bool = False,
+) -> None:
+    """Export XGBoost cascade as a runtime-load binary blob (default) and
+    optionally also as the legacy C-source form (debug aid).
+
+    The binary blob (`xgb_sched.smb`) is the form SLM-OS consumes via
+    `slm.sched_model_stage("xgboost", path)`. The C-source form was
+    Plan A's original output but was rejected for ballooning the
+    kernel image; it is kept behind `--xgb-emit-c-source` for local
+    inspection only and never shipped.
+    """
     model_dir = Path("models/xgboost")
     if not (model_dir / "meta.json").exists():
         print(f"  SKIP: {model_dir}/meta.json not found")
         return
 
     trees_data = export_xgboost_trees(model_dir)
-    write_xgboost_c(trees_data, output_dir)
+    write_xgboost_blob(trees_data, output_dir)
+    generate_xgb_verification_data(model_dir, output_dir)
+    if emit_c_source:
+        # Retained debug path; produces ~24 MB of C source. Useful only
+        # for visually inspecting tree structure in a text editor.
+        write_xgboost_c(trees_data, output_dir)
 
 
 def main():
@@ -726,7 +1082,7 @@ def main():
         description="Export trained models to C deployment format"
     )
     parser.add_argument(
-        "--model", choices=["mlp", "ppo", "all"], default="all",
+        "--model", choices=["mlp", "ppo", "xgboost", "all"], default="all",
         help="Which model to export (default: all)",
     )
     parser.add_argument(
@@ -737,6 +1093,11 @@ def main():
     parser.add_argument(
         "--output-dir", type=str, default=None,
         help="Output directory (default: deploy/generated/)",
+    )
+    parser.add_argument(
+        "--xgb-emit-c-source", action="store_true",
+        help="(debug) Also emit the XGBoost cascade as legacy C source. "
+             "Default off; ~24 MB of C is large and not shipped.",
     )
     args = parser.parse_args()
 
@@ -755,7 +1116,7 @@ def main():
     print(f"Output:   {output_dir}")
     print()
 
-    models = [args.model] if args.model != "all" else ["mlp", "ppo"]
+    models = [args.model] if args.model != "all" else ["mlp", "ppo", "xgboost"]
 
     for model_name in models:
         print(f"--- Exporting {model_name.upper()} ---")
@@ -763,6 +1124,11 @@ def main():
             export_mlp(args.platform, n_actions, output_dir)
         elif model_name == "ppo":
             export_ppo(args.platform, n_actions, output_dir)
+        elif model_name == "xgboost":
+            export_xgboost(
+                args.platform, n_actions, output_dir,
+                emit_c_source=args.xgb_emit_c_source,
+            )
         print()
 
     # Write config header with the platform's action space

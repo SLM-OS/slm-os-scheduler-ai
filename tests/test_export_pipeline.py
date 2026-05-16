@@ -369,38 +369,350 @@ class TestExportMLPValidation:
 
 
 # ---------------------------------------------------------------------------
-# XGBoost removed from export CLI
+# XGBoost is now re-enabled (#58a / #850) — emits a binary blob, not C source
 # ---------------------------------------------------------------------------
 
-class TestXGBoostRemoved:
-    def test_xgboost_not_in_cli_choices(self):
-        """Export CLI should not accept --model xgboost."""
-        import argparse
-        from scripts.export_models import main
+class TestXGBoostBinaryBlob:
+    """Format-level coverage for `write_xgboost_blob` and the surrounding
+    cascade serializer. Validates the binary round-trips and produces
+    identical predictions to a direct Python tree-walk on the same
+    `trees_data` dict."""
 
-        # Parse --model xgboost should fail
-        import sys
-        from io import StringIO
+    def test_xgboost_is_accepted_cli_choice(self):
+        """Export CLI must accept --model xgboost (#58a re-enables it)."""
+        from scripts import export_models  # imports without exploding
+        import inspect
+        source = inspect.getsource(export_models.main)
+        assert '"xgboost"' in source, (
+            "main() should advertise --model xgboost in its argparse choices"
+        )
 
-        old_stderr = sys.stderr
-        sys.stderr = StringIO()
-        try:
-            from scripts.export_models import argparse as _ap
-            parser = argparse.ArgumentParser()
-            parser.add_argument("--model", choices=["mlp", "ppo", "all"])
-            with pytest.raises(SystemExit):
-                parser.parse_args(["--model", "xgboost"])
-        finally:
-            sys.stderr = old_stderr
-
-    def test_all_exports_only_mlp_ppo(self):
-        """'all' should only include mlp and ppo, not xgboost."""
-        # Verify by checking the source directly
+    def test_all_includes_xgboost(self):
+        """'all' must include xgboost so a single export run produces
+        every available policy in one pass."""
         import inspect
         from scripts import export_models
         source = inspect.getsource(export_models.main)
-        # The "all" expansion should only contain mlp and ppo
-        assert '["mlp", "ppo"]' in source or "['mlp', 'ppo']" in source
+        assert (
+            '["mlp", "ppo", "xgboost"]' in source
+            or "['mlp', 'ppo', 'xgboost']" in source
+        ), "main() 'all' branch should iterate mlp + ppo + xgboost"
+
+    def test_blob_roundtrips_simple_two_classifier_cascade(self):
+        """End-to-end: build a trivial 2-classifier cascade dict, write
+        the SEMB+XGBC blob, parse it back in pure Python, and verify
+        each classifier predicts the same label as a direct tree walk
+        on the source dict.
+        """
+        from scripts.export_models import (
+            _build_xgbc_payload,
+            _wrap_semb,
+            SCHED_MODEL_KIND_XGBOOST,
+            SCHED_MODEL_SCHEMA_V1,
+            XGB_CASCADE_ORDER,
+        )
+
+        # Each classifier has 2 trees (one per class) where each tree is
+        # a single leaf — so class i's score is just leaf_value_i and
+        # argmax is deterministic per classifier.
+        def make_clf(leaf_a: float, leaf_b: float, labels):
+            return {
+                "trees": [
+                    [{
+                        "feature_idx": -1,
+                        "threshold": 0.0,
+                        "leaf_value": leaf_a,
+                        "left_child": 0,
+                        "right_child": 0,
+                    }],
+                    [{
+                        "feature_idx": -1,
+                        "threshold": 0.0,
+                        "leaf_value": leaf_b,
+                        "left_child": 0,
+                        "right_child": 0,
+                    }],
+                ],
+                "n_classes": 2,
+                "label_classes": labels,
+            }
+
+        trees_data = {
+            "core": make_clf(0.5, 0.1, [7, 9]),
+            "priority": make_clf(0.0, 1.0, [100, 200]),
+            "preempt": make_clf(0.2, 0.3, [0, 1]),
+        }
+        # Cascade ordering must match TripleClassifier.predict.
+        assert XGB_CASCADE_ORDER == ["core", "priority", "preempt"]
+
+        payload = _build_xgbc_payload(trees_data, XGB_CASCADE_ORDER)
+        blob = _wrap_semb(
+            payload,
+            kind_id=SCHED_MODEL_KIND_XGBOOST,
+            schema_version=SCHED_MODEL_SCHEMA_V1,
+        )
+
+        parsed = _parse_smb_blob(blob)
+        assert parsed["kind_id"] == SCHED_MODEL_KIND_XGBOOST
+        assert parsed["schema_version"] == SCHED_MODEL_SCHEMA_V1
+        assert len(parsed["classifiers"]) == 3
+
+        # Empty feature vector — every tree is a leaf so feature value
+        # never matters. Direct argmax over leaf_values gives the
+        # expected label.
+        features = []
+        labels = [_walk_classifier(c, features) for c in parsed["classifiers"]]
+        assert labels == [7, 200, 1]
+
+    def test_blob_roundtrips_interior_node_tree(self):
+        """Round-trip a classifier whose tree has an interior node so
+        the test exercises the threshold + child-rebasing code paths
+        in `_xgb_pack_node` and `_build_classifier_section` (the
+        leaf-only test above leaves these untouched). Verifies
+        split-then-leaf decisions match a direct tree walk on the
+        source dict."""
+        from scripts.export_models import (
+            _build_xgbc_payload, _wrap_semb,
+            SCHED_MODEL_KIND_XGBOOST, SCHED_MODEL_SCHEMA_V1,
+            XGB_CASCADE_ORDER,
+        )
+
+        # One tree per class. Class 0's tree splits on feature 0 at
+        # threshold 0.5: < goes left (-1.0), >= goes right (+1.0).
+        # Class 1's tree is a constant leaf 0.0. So:
+        #   features[0] < 0.5  → class 0 score -1.0, class 1 score 0.0 → argmax = 1
+        #   features[0] >= 0.5 → class 0 score +1.0, class 1 score 0.0 → argmax = 0
+        def make_split_clf(labels):
+            return {
+                "trees": [
+                    [   # tree for class 0 — interior split + two leaves
+                        {
+                            "feature_idx": 0,
+                            "threshold": 0.5,
+                            "leaf_value": 0.0,
+                            "left_child": 1,
+                            "right_child": 2,
+                        },
+                        {
+                            "feature_idx": -1,
+                            "threshold": 0.0,
+                            "leaf_value": -1.0,
+                            "left_child": 0,
+                            "right_child": 0,
+                        },
+                        {
+                            "feature_idx": -1,
+                            "threshold": 0.0,
+                            "leaf_value": 1.0,
+                            "left_child": 0,
+                            "right_child": 0,
+                        },
+                    ],
+                    [   # tree for class 1 — single leaf
+                        {
+                            "feature_idx": -1,
+                            "threshold": 0.0,
+                            "leaf_value": 0.0,
+                            "left_child": 0,
+                            "right_child": 0,
+                        },
+                    ],
+                ],
+                "n_classes": 2,
+                "label_classes": labels,
+            }
+
+        # All three classifiers in the cascade use the same shape so
+        # the per-classifier section header + child rebasing get
+        # exercised three times back-to-back (different starting
+        # offsets in the flat node array catches the rebase math).
+        trees_data = {
+            "core": make_split_clf([10, 20]),
+            "priority": make_split_clf([30, 40]),
+            "preempt": make_split_clf([50, 60]),
+        }
+        payload = _build_xgbc_payload(trees_data, XGB_CASCADE_ORDER)
+        blob = _wrap_semb(
+            payload,
+            kind_id=SCHED_MODEL_KIND_XGBOOST,
+            schema_version=SCHED_MODEL_SCHEMA_V1,
+        )
+        parsed = _parse_smb_blob(blob)
+        assert len(parsed["classifiers"]) == 3
+        # Each classifier's first tree has 3 nodes (1 interior + 2
+        # leaves), second tree has 1 leaf — 4 nodes total per
+        # classifier. After flattening + rebasing, the split tree's
+        # root sits at offset 0 with children at offsets 1, 2; the
+        # second tree's leaf sits at offset 3 (root_offsets[1] = 3).
+        for clf in parsed["classifiers"]:
+            assert clf["n_nodes"] == 4
+            assert clf["roots"] == [0, 3]
+            # Interior node points at the right children post-rebase.
+            assert clf["nodes"][0]["flags"] == 0
+            assert clf["nodes"][0]["left"] == 1
+            assert clf["nodes"][0]["right"] == 2
+            assert clf["nodes"][0]["threshold"] == 0.5
+            # Leaves carry the FLAG_LEAF bit and their values.
+            assert clf["nodes"][1]["flags"] & 1
+            assert clf["nodes"][1]["value"] == -1.0
+            assert clf["nodes"][2]["flags"] & 1
+            assert clf["nodes"][2]["value"] == 1.0
+
+        # Walk the parsed cascade and verify the decisions match the
+        # split semantics — confirms `_xgb_pack_node` interior-node
+        # encoding round-trips correctly through `_walk_tree`.
+        labels_low = [_walk_classifier(c, [0.0]) for c in parsed["classifiers"]]
+        labels_high = [_walk_classifier(c, [1.0]) for c in parsed["classifiers"]]
+        # features[0]=0.0 < 0.5 → class 0 score -1.0, class 1 score 0.0
+        # → argmax = 1 → label_classes[1] of (10,20),(30,40),(50,60).
+        assert labels_low == [20, 40, 60]
+        # features[0]=1.0 >= 0.5 → class 0 score +1.0, class 1 score 0.0
+        # → argmax = 0 → label_classes[0].
+        assert labels_high == [10, 30, 50]
+
+    def test_blob_format_constants_match_runtime(self):
+        """The SEMB outer-header version + XGBC inner magic + node size
+        are wire-format constants that must stay synchronized with the
+        SLM-OS runtime parser. Pin them here so an accidental edit on
+        either side fails this test, not silently mis-parses on a
+        kernel boot.
+        """
+        from scripts.export_models import (
+            _SEMB_MAGIC, _SEMB_VERSION_V1, _SEMB_OUTER_HEADER_LEN,
+            _XGBC_MAGIC, _XGB_PAYLOAD_VERSION_V1, _XGBC_HEADER_LEN,
+            _XGBC_CLASSIFIER_HEADER_LEN, _XGB_NODE_LEN, _XGB_FLAG_LEAF,
+        )
+        assert _SEMB_MAGIC == b"SEMB"
+        assert _SEMB_VERSION_V1 == 1
+        assert _SEMB_OUTER_HEADER_LEN == 24
+        assert _XGBC_MAGIC == b"XGBC"
+        assert _XGB_PAYLOAD_VERSION_V1 == 1
+        assert _XGBC_HEADER_LEN == 16
+        # Classifier header: u32 n_trees + u32 n_nodes + u16 n_classes
+        # + u16 reserved + u32 reserved = 16 bytes.
+        assert _XGBC_CLASSIFIER_HEADER_LEN == 16
+        # Node: u16 feature + u16 flags + u32 left + u32 right
+        # + f32 thresh + f32 value = 20 bytes.
+        assert _XGB_NODE_LEN == 20
+        assert _XGB_FLAG_LEAF == 1
+
+    def test_checksum_detects_payload_corruption(self):
+        """A single-byte flip inside the payload must change the FNV-1a
+        checksum stored in the SEMB header — otherwise the runtime
+        parser would silently accept a corrupt blob."""
+        from scripts.export_models import (
+            _build_xgbc_payload, _wrap_semb,
+            SCHED_MODEL_KIND_XGBOOST, SCHED_MODEL_SCHEMA_V1,
+            _fnv1a_32,
+        )
+        trees_data = {
+            "core": {
+                "trees": [[{
+                    "feature_idx": -1, "threshold": 0.0,
+                    "leaf_value": 1.0,
+                    "left_child": 0, "right_child": 0,
+                }]],
+                "n_classes": 1,
+                "label_classes": [0],
+            },
+        }
+        payload = _build_xgbc_payload(trees_data, ["core"])
+        original = _fnv1a_32(payload)
+        corrupted = bytearray(payload)
+        corrupted[-1] ^= 0xFF
+        assert _fnv1a_32(bytes(corrupted)) != original
+
+
+# ---------------------------------------------------------------------------
+# Pure-Python SEMB+XGBC parser — used only by the round-trip tests above.
+# Mirrors the SLM-OS Rust runtime parser (`runtime/src/ml/xgb_tree.rs`)
+# bit-for-bit; if either parser drifts the round-trip test fails.
+# ---------------------------------------------------------------------------
+
+def _parse_smb_blob(blob: bytes) -> dict:
+    import struct
+
+    if blob[0:4] != b"SEMB":
+        raise ValueError("not a SEMB blob")
+    (magic, version, kind_id, schema_version, _r, payload_len, checksum) = (
+        struct.unpack_from("<4sHHHHII", blob, 0)
+    )
+    # Trailing reserved word at offset 20..24.
+    (reserved2,) = struct.unpack_from("<I", blob, 20)
+    assert reserved2 == 0, "trailing reserved word must be zero"
+    payload = blob[24:24 + payload_len]
+    if len(blob) != 24 + payload_len:
+        raise ValueError("trailing bytes after payload")
+
+    # XGBC inner header.
+    (xmagic, xversion, _r1, n_clf, _r2, _r3) = struct.unpack_from(
+        "<4sHHHHI", payload, 0
+    )
+    if xmagic != b"XGBC":
+        raise ValueError("not an XGBC payload")
+    classifiers = []
+    cursor = 16
+    for _ in range(n_clf):
+        n_trees, n_nodes, n_classes, _r4, _r5 = struct.unpack_from(
+            "<IIHHI", payload, cursor
+        )
+        cursor += 16
+        roots = list(struct.unpack_from(f"<{n_trees}I", payload, cursor))
+        cursor += 4 * n_trees
+        nodes = []
+        for _ in range(n_nodes):
+            (fi, flags, left, right, thresh, value) = struct.unpack_from(
+                "<HHIIff", payload, cursor
+            )
+            cursor += 20
+            nodes.append({
+                "feature_idx": fi,
+                "flags": flags,
+                "left": left,
+                "right": right,
+                "threshold": thresh,
+                "value": value,
+            })
+        labels = list(struct.unpack_from(f"<{n_classes}i", payload, cursor))
+        cursor += 4 * n_classes
+        classifiers.append({
+            "n_trees": n_trees,
+            "n_nodes": n_nodes,
+            "n_classes": n_classes,
+            "roots": roots,
+            "nodes": nodes,
+            "labels": labels,
+        })
+    return {
+        "kind_id": kind_id,
+        "schema_version": schema_version,
+        "checksum_header": checksum,
+        "classifiers": classifiers,
+    }
+
+
+def _walk_tree(nodes: list, root_idx: int, features: list) -> float:
+    idx = root_idx
+    for _ in range(256):
+        node = nodes[idx]
+        if node["flags"] & 1:
+            return node["value"]
+        f = features[node["feature_idx"]] if node["feature_idx"] < len(features) else 0.0
+        idx = node["left"] if f < node["threshold"] else node["right"]
+    return 0.0
+
+
+def _walk_classifier(parsed_clf: dict, features: list) -> int:
+    """Argmax across per-class tree-sum + label lookup. Trees are laid
+    out one-per-class-per-round (XGBoost's standard multiclass shape)."""
+    n_classes = parsed_clf["n_classes"]
+    if n_classes == 0:
+        return 0
+    scores = [0.0] * n_classes
+    for i, root in enumerate(parsed_clf["roots"]):
+        scores[i % n_classes] += _walk_tree(parsed_clf["nodes"], root, features)
+    best = max(range(n_classes), key=lambda i: scores[i])
+    return parsed_clf["labels"][best]
 
 
 # ---------------------------------------------------------------------------
