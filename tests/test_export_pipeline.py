@@ -623,6 +623,206 @@ class TestXGBoostBinaryBlob:
         assert _fnv1a_32(bytes(corrupted)) != original
 
 
+class TestXGBoostBaseScoreFold:
+    """Coverage for `_xgb_parse_base_score`, `_xgb_logit`, and the
+    base_score → synthetic-tree fold path in `export_xgboost_trees`
+    (SLM-OS #920). The runtime walker sums every tree and either
+    thresholds at 0 (binary) or argmaxes per-class scores
+    (multiclass); without the fold, predictions diverge from
+    `XGBClassifier.predict` whenever `base_score != 0.5` (binary) or
+    any per-class base differs (multiclass)."""
+
+    def test_logit_safe_against_degenerate_zero(self):
+        """`_xgb_logit(0)` clamps internally instead of overflowing
+        `log(0)`. Preempt's `base_score` empirically drops below 1e-2;
+        any future training run hitting exactly 0.0 must not crash
+        export."""
+        from scripts.export_models import _xgb_logit
+        out = _xgb_logit(0.0)
+        # Bounds derived from the eps=1e-12 clamp inside `_xgb_logit`:
+        # log(1e-12 / (1 - 1e-12)) ≈ -27.63. If eps changes, the test
+        # bounds need to track it.
+        assert out < -25.0 and out > -28.0, (
+            f"logit(0) should clamp to a large-negative finite value, got {out}"
+        )
+
+    def test_logit_safe_against_degenerate_one(self):
+        from scripts.export_models import _xgb_logit
+        out = _xgb_logit(1.0)
+        assert out > 25.0 and out < 28.0
+
+    def test_logit_matches_math_logit_for_typical(self):
+        """For non-degenerate inputs, `_xgb_logit` matches the standard
+        `log(p / (1-p))`. Pins numerical accuracy so the synthetic
+        base-margin tree's leaf value lines up with what XGBoost's
+        internal margin computation actually applies."""
+        import math
+        from scripts.export_models import _xgb_logit
+        for p in [0.0023, 0.4162, 0.5, 0.7459]:
+            expected = math.log(p / (1.0 - p))
+            assert abs(_xgb_logit(p) - expected) < 1e-9, p
+
+    def test_parse_base_score_handles_xgboost_string_scalar(self):
+        """XGBoost 1.x–3.x serialize binary base_score as
+        `"4.16e-1"`. Round-trip through the parser must produce a
+        one-element float list."""
+        from scripts.export_models import _xgb_parse_base_score
+        assert _xgb_parse_base_score("4.16e-1") == [0.416]
+        assert _xgb_parse_base_score("0.5") == [0.5]
+
+    def test_parse_base_score_handles_xgboost_string_vector(self):
+        """Multiclass base_score arrives as
+        `"[0.7,0.3,-0.1]"`. The parser walks json.loads first so a
+        future XGBoost release that switches to real JSON arrays,
+        adds whitespace, or pads with spaces after commas doesn't
+        silently break the fold."""
+        from scripts.export_models import _xgb_parse_base_score
+        assert _xgb_parse_base_score("[0.7,0.3,-0.1]") == [0.7, 0.3, -0.1]
+        # Spaces after commas — would have broken the prior naive
+        # `split(",")` form.
+        assert _xgb_parse_base_score("[0.7, 0.3, -0.1]") == [0.7, 0.3, -0.1]
+
+    def test_parse_base_score_handles_real_list_or_float(self):
+        """Defense against XGBoost ever returning a native Python type
+        instead of a string-encoded one."""
+        from scripts.export_models import _xgb_parse_base_score
+        assert _xgb_parse_base_score([0.7, 0.3]) == [0.7, 0.3]
+        assert _xgb_parse_base_score(0.5) == [0.5]
+        assert _xgb_parse_base_score(1) == [1.0]
+
+    def test_synth_leaf_tree_shape_matches_flatten_tree_output(self):
+        """The synthetic tree node MUST match the shape `_flatten_tree`
+        emits for a `{"leaf": value}` JSON node — both go through
+        `_build_classifier_section` and a shape drift would break the
+        on-disk node layout assertion."""
+        from scripts.export_models import _xgb_synth_leaf_tree, _flatten_tree
+        synth = _xgb_synth_leaf_tree(0.5)
+        real = []
+        _flatten_tree({"leaf": 0.5}, real)
+        assert synth == real, f"synth {synth} differs from flatten {real}"
+
+    def test_export_prepends_synthetic_base_margin_trees(self, tmp_path):
+        """End-to-end: train two tiny XGBoost classifiers (one binary,
+        one multiclass), export, and assert the result has exactly
+        `n_classes` extra trees prepended per classifier with leaf
+        values matching the per-class base margins."""
+        import json as _json
+        import math as _math
+        import numpy as _np
+        import xgboost as xgb_mod
+        from scripts.export_models import export_xgboost_trees
+
+        rng = _np.random.default_rng(7)
+        # Binary classifier — pin `base_score` explicitly so the test
+        # doesn't depend on XGBoost's auto-derivation logic (which is
+        # version-sensitive). 0.03 mirrors preempt's pathological
+        # imbalance, giving a strongly negative class-1 logit.
+        pinned_base = 0.03
+        X_bin = rng.random((400, 6), dtype=_np.float32)
+        y_bin = (rng.random(400) > 0.97).astype(_np.int32)
+        bin_clf = xgb_mod.XGBClassifier(
+            n_estimators=4, max_depth=2, random_state=0,
+            base_score=pinned_base,
+        ).fit(X_bin, y_bin)
+
+        # Multiclass — three balanced classes.
+        X_multi = rng.random((400, 6), dtype=_np.float32)
+        y_multi = rng.integers(0, 3, size=400).astype(_np.int32)
+        multi_clf = xgb_mod.XGBClassifier(
+            n_estimators=4, max_depth=2, random_state=0,
+            objective="multi:softprob", num_class=3,
+        ).fit(X_multi, y_multi)
+
+        # Stage them under the keys export_xgboost_trees expects.
+        # Same model under all three slots is fine — we only care
+        # about per-classifier shape, not cross-classifier wiring.
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+        bin_clf.save_model(str(model_dir / "core_clf.json"))
+        bin_clf.save_model(str(model_dir / "priority_clf.json"))
+        multi_clf.save_model(str(model_dir / "preempt_clf.json"))
+        (model_dir / "meta.json").write_text(_json.dumps({
+            "core_classes": [0, 1],
+            "priority_classes": [0, 1],
+            "preempt_classes": [0, 1, 2],
+        }))
+
+        n_bin_real = bin_clf.get_booster().num_boosted_rounds()  # 4
+        n_multi_real = (
+            multi_clf.get_booster().num_boosted_rounds() * 3
+        )  # 4 * 3 classes
+
+        result = export_xgboost_trees(model_dir)
+
+        # Binary slot: 2 synthetic trees prepended, then n_bin_real
+        # real trees, total = 2 + n_bin_real. First two trees are
+        # single-leaf with values [0.0, logit(base_score)].
+        assert len(result["core"]["trees"]) == 2 + n_bin_real
+        first = result["core"]["trees"][0]
+        second = result["core"]["trees"][1]
+        assert len(first) == 1 and first[0]["feature_idx"] == -1
+        assert first[0]["leaf_value"] == 0.0
+        assert len(second) == 1 and second[0]["feature_idx"] == -1
+        # Class-1 leaf must equal logit(pinned_base) within float
+        # tolerance. logit(0.03) ≈ -3.476 — well outside what a
+        # default base_score=0.5 (logit=0) or rounding noise could
+        # produce, so a regression in the fold (e.g. forgetting the
+        # logit transform, or fetching the wrong booster field) makes
+        # this assertion fail loudly with a specific delta rather
+        # than a vague threshold miss.
+        expected_logit = _math.log(pinned_base / (1.0 - pinned_base))
+        assert abs(second[0]["leaf_value"] - expected_logit) < 1e-4, (
+            f"expected leaf ≈ logit({pinned_base}) = {expected_logit:.6f}, "
+            f"got {second[0]['leaf_value']}"
+        )
+
+        # Multiclass slot: 3 synthetic trees prepended, each carrying
+        # the per-class margin from XGBoost's base_score vector.
+        assert len(result["preempt"]["trees"]) == 3 + n_multi_real
+        for cls_idx in range(3):
+            t = result["preempt"]["trees"][cls_idx]
+            assert len(t) == 1
+            assert t[0]["feature_idx"] == -1
+            # Margins for a roughly-balanced 3-class fit should all
+            # be finite and small in magnitude (within ~2.0).
+            assert _math.isfinite(t[0]["leaf_value"])
+            assert abs(t[0]["leaf_value"]) < 2.0, t[0]["leaf_value"]
+
+    def test_export_raises_on_base_score_length_mismatch(self, tmp_path):
+        """A 3-element `base_score` with `n_classes == 4` (or any
+        other non-binary mismatch) is a bug, not silent acceptance.
+        Guards against a future XGBoost release that changes the
+        binary `base_score` encoding shape."""
+        import json as _json
+        import numpy as _np
+        import xgboost as xgb_mod
+        from scripts.export_models import export_xgboost_trees
+
+        rng = _np.random.default_rng(3)
+        X = rng.random((200, 4), dtype=_np.float32)
+        y = rng.integers(0, 3, size=200).astype(_np.int32)
+        clf = xgb_mod.XGBClassifier(
+            n_estimators=2, max_depth=2, random_state=0,
+            objective="multi:softprob", num_class=3,
+        ).fit(X, y)
+
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+        clf.save_model(str(model_dir / "core_clf.json"))
+        clf.save_model(str(model_dir / "priority_clf.json"))
+        clf.save_model(str(model_dir / "preempt_clf.json"))
+        # Declare 4 classes in meta while the booster only has 3 —
+        # forces the length-check path.
+        (model_dir / "meta.json").write_text(_json.dumps({
+            "core_classes": [10, 20, 30, 40],
+            "priority_classes": [1, 2, 3],
+            "preempt_classes": [0, 1, 2],
+        }))
+
+        with pytest.raises(ValueError, match="base_score length"):
+            export_xgboost_trees(model_dir)
+
+
 # ---------------------------------------------------------------------------
 # Pure-Python SEMB+XGBC parser — used only by the round-trip tests above.
 # Mirrors the SLM-OS Rust runtime parser (`runtime/src/ml/xgb_tree.rs`)
